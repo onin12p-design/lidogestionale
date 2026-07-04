@@ -261,11 +261,13 @@ export default function SubscriptionsModule({
         startDate,
         endDate,
         slot,
-        daysOfWeek: selectedDays.length > 0 ? selectedDays : undefined,
         priceTotal,
         status: "active",
         notes: customerNotes
       };
+      if (selectedDays.length > 0) {
+        subscriptionData.daysOfWeek = selectedDays;
+      }
 
       await setDoc(subscriptionRef, subscriptionData);
 

@@ -1,0 +1,218 @@
+import express from "express";
+import path from "path";
+import multer from "multer";
+import { GoogleGenAI, Type } from "@google/genai";
+import { createServer as createViteServer } from "vite";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const app = express();
+const PORT = 3000;
+
+// Setup JSON and URL-encoded body parsers
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+// Setup Multer for memory storage
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit per file
+});
+
+// Set of valid bed numbers as defined by the immutable map
+const VALID_BEDS = new Set([
+  // PEDANA SINISTRA — LEFT
+  1, 2, 3, 4, 5,
+  11, 12, 13, 14, 15,
+  21, 22, 23, 24, 25,
+  31, 32, 33, 34,
+  // PEDANA SINISTRA — RIGHT
+  6, 7, 8, 9, 10,
+  16, 17, 18, 19, 20,
+  26, 27, 28, 29, 30,
+  // PEDANA DESTRA — LEFT
+  60, 61, 62, 63, 64,
+  71, 72, 73, 74, 75,
+  82, 83, 84, 85, 86,
+  93, 94, 95, 96, 97,
+  // PEDANA DESTRA — RIGHT
+  65, 66, 67, 68, 69, 70,
+  76, 77, 78, 79, 80, 81,
+  87, 88, 89, 90, 91, 92,
+  98, 99, 100, 101, 102, 103,
+  104, 105, 106, 107, 108, 109
+]);
+
+// Lazy-initialized Gemini client to prevent crashes on startup if key is missing
+let aiInstance: GoogleGenAI | null = null;
+function getGemini(): GoogleGenAI {
+  if (!aiInstance) {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      throw new Error("GEMINI_API_KEY environment variable is missing.");
+    }
+    aiInstance = new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        }
+      }
+    });
+  }
+  return aiInstance;
+}
+
+// Health check endpoint
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// API endpoint to parse uploaded files using Gemini
+app.post("/api/parse-scanner", upload.array("files"), async (req, res) => {
+  try {
+    const files = req.files as Express.Multer.File[];
+    if (!files || files.length === 0) {
+      res.status(400).json({ error: "Nessun file caricato." });
+      return;
+    }
+
+    const ai = getGemini();
+    const allExtractedItems: any[] = [];
+    const errors: string[] = [];
+
+    for (const file of files) {
+      try {
+        const base64Data = file.buffer.toString("base64");
+        
+        // Prepare file part
+        const filePart = {
+          inlineData: {
+            mimeType: file.mimetype,
+            data: base64Data
+          }
+        };
+
+        const promptText = `
+Estrai tutte le prenotazioni o registrazioni del lido presenti in questo documento o immagine.
+Estrai un elenco strutturato con le seguenti informazioni per ciascuna riga trovata:
+- bedNumber: il numero del lettino (un intero tra 1 e 109).
+- customerName: il nome o cognome del cliente. Se non disponibile, usa una descrizione generica come 'Cliente'.
+- customerType: il tipo di cliente. Può essere 'daily' (giornaliero, es. se ha pagato una singola giornata) o 'subscriber' (abbonato, stagionale). Cerca indizi come 'abbonato', 'abbonamento', 'stagionale', 'fisso' o 'giornaliero'. Di default usa 'daily'.
+- slot: la fascia oraria. Deve essere una delle seguenti: 'morning' (mattina), 'afternoon' (pomeriggio), o 'full_day' (giornata intera). Cerca riferimenti come 'mattina', 'pomeriggio', '9-13', '13-19', 'giornata intera' o orari estesi. Di default usa 'full_day'.
+- notes: eventuali note aggiuntive estratte (es. richieste speciali, acconti, etc.).
+
+Se trovi righe che fanno riferimento a lettini multipli (es. 'Lettini 12 e 13'), crea righe separate per ciascun lettino.
+Restituisci solo un array di oggetti validi secondo la risposta strutturata JSON richiesta.
+        `;
+
+        const response = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: [
+            filePart,
+            { text: promptText }
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                items: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      bedNumber: {
+                        type: Type.INTEGER,
+                        description: "Il numero del lettino (1-109)."
+                      },
+                      customerName: {
+                        type: Type.STRING,
+                        description: "Il nome completo o identificativo del cliente."
+                      },
+                      customerType: {
+                        type: Type.STRING,
+                        enum: ["daily", "subscriber"],
+                        description: "Tipo di cliente: daily o subscriber."
+                      },
+                      slot: {
+                        type: Type.STRING,
+                        enum: ["morning", "afternoon", "full_day"],
+                        description: "Fascia oraria della prenotazione."
+                      },
+                      notes: {
+                        type: Type.STRING,
+                        description: "Eventuali note estratte."
+                      }
+                    },
+                    required: ["bedNumber", "customerName", "customerType", "slot"]
+                  }
+                }
+              },
+              required: ["items"]
+            }
+          }
+        });
+
+        const textResult = response.text;
+        if (textResult) {
+          const parsed = JSON.parse(textResult.trim());
+          if (parsed && Array.isArray(parsed.items)) {
+            parsed.items.forEach((item: any) => {
+              // Perform validation on bed number
+              const num = Number(item.bedNumber);
+              const isValid = VALID_BEDS.has(num);
+              
+              allExtractedItems.push({
+                ...item,
+                bedNumber: num,
+                isValidBed: isValid,
+                fileName: file.originalname
+              });
+            });
+          }
+        }
+      } catch (err: any) {
+        console.error("Errore nel parsing del singolo file:", err);
+        errors.push(`File ${file.originalname}: ${err.message || String(err)}`);
+      }
+    }
+
+    res.json({
+      success: true,
+      items: allExtractedItems,
+      errors: errors.length > 0 ? errors : null
+    });
+  } catch (error: any) {
+    console.error("Errore generale nell'endpoint /api/parse-scanner:", error);
+    res.status(500).json({ error: error.message || "Errore durante l'elaborazione dei documenti con Gemini." });
+  }
+});
+
+// Setup Vite Dev Server / Static files
+async function setupVite() {
+  if (process.env.NODE_ENV !== "production") {
+    console.log("Starting in DEVELOPMENT mode with Vite Middleware...");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    console.log("Starting in PRODUCTION mode...");
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+setupVite().catch((err) => {
+  console.error("Failed to setup server:", err);
+});

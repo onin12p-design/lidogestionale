@@ -1,0 +1,222 @@
+{
+  "entities": {
+    "Customer": {
+      "title": "Customer",
+      "description": "Represents a customer of the lido",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Customer name"
+        },
+        "phone": {
+          "type": "string",
+          "description": "Customer phone number"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["daily", "subscriber"],
+          "description": "Customer type"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Optional notes"
+        }
+      },
+      "required": ["name", "type"]
+    },
+    "Subscription": {
+      "title": "Subscription",
+      "description": "Represents a seasonal or multi-day subscription for beds",
+      "type": "object",
+      "properties": {
+        "customerId": {
+          "type": "string",
+          "description": "ID of the customer"
+        },
+        "bedNumbers": {
+          "type": "array",
+          "description": "Assigned bed numbers"
+        },
+        "startDate": {
+          "type": "string",
+          "format": "date",
+          "description": "Start date in YYYY-MM-DD format"
+        },
+        "endDate": {
+          "type": "string",
+          "format": "date",
+          "description": "End date in YYYY-MM-DD format"
+        },
+        "slot": {
+          "type": "string",
+          "enum": ["morning", "afternoon", "full_day"],
+          "description": "Timeslot for the subscription"
+        },
+        "daysOfWeek": {
+          "type": "array",
+          "description": "Optional list of days of week (0-6)"
+        },
+        "priceTotal": {
+          "type": "number",
+          "description": "Total price of the subscription"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "expired", "cancelled"],
+          "description": "Status of subscription"
+        }
+      },
+      "required": ["customerId", "bedNumbers", "startDate", "endDate", "slot", "priceTotal", "status"]
+    },
+    "Booking": {
+      "title": "Booking",
+      "description": "Represents a daily bed booking with determinisitic ID date_bedNumber_slot",
+      "type": "object",
+      "properties": {
+        "bedNumber": {
+          "type": "integer",
+          "description": "Bed number"
+        },
+        "date": {
+          "type": "string",
+          "format": "date",
+          "description": "Date YYYY-MM-DD"
+        },
+        "slot": {
+          "type": "string",
+          "enum": ["morning", "afternoon", "full_day"],
+          "description": "Timeslot"
+        },
+        "customerId": {
+          "type": "string",
+          "description": "Customer ID reference"
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Denormalized name for performance"
+        },
+        "customerType": {
+          "type": "string",
+          "enum": ["daily", "subscriber"],
+          "description": "Type of customer"
+        },
+        "subscriptionId": {
+          "type": "string",
+          "description": "Subscription ID if generated from one"
+        },
+        "source": {
+          "type": "string",
+          "enum": ["manual", "scanner", "subscription"],
+          "description": "Source of booking"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Notes for booking"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Firestore timestamp of creation"
+        }
+      },
+      "required": ["bedNumber", "date", "slot", "customerName", "customerType", "source"]
+    },
+    "Payment": {
+      "title": "Payment",
+      "description": "Represents a cash or card payment",
+      "type": "object",
+      "properties": {
+        "customerId": {
+          "type": "string",
+          "description": "Customer reference"
+        },
+        "subscriptionId": {
+          "type": "string",
+          "description": "Subscription reference if deposit/payment for subscription"
+        },
+        "bookingId": {
+          "type": "string",
+          "description": "Booking reference if daily booking"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Paid amount"
+        },
+        "method": {
+          "type": "string",
+          "enum": ["cash", "card"],
+          "description": "Payment method"
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["full", "deposit"],
+          "description": "Full payment or deposit"
+        },
+        "date": {
+          "type": "string",
+          "description": "Firestore timestamp"
+        },
+        "operator": {
+          "type": "string",
+          "description": "Staff operator name"
+        }
+      },
+      "required": ["amount", "method", "kind", "date"]
+    },
+    "Tab": {
+      "title": "Tab",
+      "description": "Extra consumptions (drinks, etc.) bound to a bed booking",
+      "type": "object",
+      "properties": {
+        "bookingId": {
+          "type": "string",
+          "description": "Booking reference"
+        },
+        "bedNumber": {
+          "type": "integer",
+          "description": "Bed number"
+        },
+        "date": {
+          "type": "string",
+          "description": "Date in YYYY-MM-DD"
+        },
+        "items": {
+          "type": "array",
+          "description": "Items list containing label, price, qty"
+        },
+        "paid": {
+          "type": "boolean",
+          "description": "Is this tab paid"
+        },
+        "paidMethod": {
+          "type": "string",
+          "enum": ["cash", "card"],
+          "description": "Payment method if paid"
+        }
+      },
+      "required": ["bookingId", "bedNumber", "date", "items", "paid"]
+    }
+  },
+  "firestore": {
+    "/customers/{customerId}": {
+      "schema": "Customer",
+      "description": "Customers collection"
+    },
+    "/subscriptions/{subscriptionId}": {
+      "schema": "Subscription",
+      "description": "Subscriptions collection"
+    },
+    "/bookings/{bookingId}": {
+      "schema": "Booking",
+      "description": "Determinisitic bookings: date_bedNumber_slot"
+    },
+    "/payments/{paymentId}": {
+      "schema": "Payment",
+      "description": "Payments list"
+    },
+    "/tabs/{tabId}": {
+      "schema": "Tab",
+      "description": "Food/drink tabs associated with bed bookings"
+    }
+  }
+}

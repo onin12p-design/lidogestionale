@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "Gestionale Lido Samarinda",
+  "description": "Beach club management system with reservation, subscription, scanner, cashier, and public client availability checking.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

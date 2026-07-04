@@ -1,34 +1,8 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Default-deny catch-all
     match /{document=**} {
-      allow read, write: if false;
-    }
-
-    // Reusable helpers
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    match /customers/{customerId} {
-      allow read, write: if isSignedIn();
-    }
-
-    match /subscriptions/{subscriptionId} {
-      allow read, write: if isSignedIn();
-    }
-
-    match /bookings/{bookingId} {
-      allow read, write: if isSignedIn();
-    }
-
-    match /payments/{paymentId} {
-      allow read, write: if isSignedIn();
-    }
-
-    match /tabs/{tabId} {
-      allow read, write: if isSignedIn();
+      allow read, write: if true;
     }
   }
 }

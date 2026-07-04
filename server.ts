@@ -5,10 +5,30 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 
+// Firebase web imports for server-side API proxying
+import { initializeApp } from "firebase/app";
+import { getFirestore, collection, getDocs, query, where } from "firebase/firestore";
+import { getAuth, signInAnonymously } from "firebase/auth";
+import firebaseConfig from "./firebase-applet-config.json";
+
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
+
+// Initialize Firebase App on the server
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+const auth = getAuth(firebaseApp);
+
+// Authenticate server anonymously to read/write Firestore
+signInAnonymously(auth)
+  .then(() => {
+    console.log("Server authenticated with Firestore successfully.");
+  })
+  .catch((err) => {
+    console.warn("Server anonymous auth failed (continuing with unauthenticated session):", err);
+  });
 
 // Setup JSON and URL-encoded body parsers
 app.use(express.json({ limit: "50mb" }));
@@ -67,6 +87,124 @@ function getGemini(): GoogleGenAI {
 // Health check endpoint
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// GET available Gemini models
+app.get("/api/verify-models", async (req, res) => {
+  try {
+    const ai = getGemini();
+    const result = await ai.models.list();
+    res.json({ success: true, models: result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// Timezone date helper for server validations
+function getRomeTodayStringServer(): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Rome",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  return formatter.format(new Date());
+}
+
+// Check if a date string is in YYYY-MM-DD format and is between today and today+60 days
+function isValidDateRange(dateStr: string): boolean {
+  const dateReg = /^\d{4}-\d{2}-\d{2}$/;
+  if (!dateStr || !dateReg.test(dateStr)) return false;
+
+  const todayStr = getRomeTodayStringServer();
+  if (dateStr < todayStr) return false;
+
+  // Compute 60 days ahead
+  const [ty, tm, td] = todayStr.split("-").map(Number);
+  const maxDate = new Date(ty, tm - 1, td + 60);
+  const maxYear = maxDate.getFullYear();
+  const maxMonth = String(maxDate.getMonth() + 1).padStart(2, "0");
+  const maxDay = String(maxDate.getDate()).padStart(2, "0");
+  const maxStr = `${maxYear}-${maxMonth}-${maxDay}`;
+
+  return dateStr <= maxStr;
+}
+
+// Cache store for availability queries (30 seconds TTL)
+const availabilityCache: Record<string, { timestamp: number; data: any }> = {};
+
+// Public secure client-side API endpoint for beach availability
+app.get("/api/availability", async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (typeof date !== "string") {
+      res.status(400).json({ error: "Parametro 'date' mancante." });
+      return;
+    }
+
+    if (!isValidDateRange(date)) {
+      res.status(400).json({ error: "La data fornita deve essere compresa tra oggi e i prossimi 60 giorni." });
+      return;
+    }
+
+    // Check Cache (30 seconds)
+    const now = Date.now();
+    const cached = availabilityCache[date];
+    if (cached && (now - cached.timestamp < 30000)) {
+      res.json(cached.data);
+      return;
+    }
+
+    // Fetch from Firestore
+    const bookingsQuery = query(collection(db, "bookings"), where("date", "==", date));
+    const snapshot = await getDocs(bookingsQuery);
+
+    // Map existing bookings by bed number
+    const bedBookings: Record<number, { morning?: boolean; afternoon?: boolean; full_day?: boolean }> = {};
+    snapshot.forEach((docSnap) => {
+      const data = docSnap.data();
+      const bedNum = Number(data.bedNumber);
+      const slot = data.slot as string;
+      if (!bedBookings[bedNum]) {
+        bedBookings[bedNum] = {};
+      }
+      if (slot === "morning") bedBookings[bedNum].morning = true;
+      if (slot === "afternoon") bedBookings[bedNum].afternoon = true;
+      if (slot === "full_day") bedBookings[bedNum].full_day = true;
+    });
+
+    // Build complete availability for all 109 beds
+    const availabilityList = Array.from(VALID_BEDS).map((bedNum) => {
+      const bookings = bedBookings[bedNum];
+      let status: "free" | "morning_free" | "afternoon_free" | "full" = "free";
+
+      if (bookings) {
+        if (bookings.full_day || (bookings.morning && bookings.afternoon)) {
+          status = "full";
+        } else if (bookings.morning) {
+          status = "afternoon_free"; // morning occupied -> afternoon free
+        } else if (bookings.afternoon) {
+          status = "morning_free"; // afternoon occupied -> morning free
+        }
+      }
+
+      return {
+        bedNumber: bedNum,
+        status
+      };
+    });
+
+    // Save to Cache
+    availabilityCache[date] = {
+      timestamp: now,
+      data: availabilityList
+    };
+
+    res.json(availabilityList);
+  } catch (error: any) {
+    console.error("Errore nell'endpoint /api/availability:", error);
+    res.status(500).json({ error: "Errore nel caricamento della disponibilità." });
+  }
 });
 
 // API endpoint to parse uploaded files using Gemini

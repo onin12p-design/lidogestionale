@@ -1,18 +1,27 @@
 import React, { useState, useEffect } from "react";
 import { Subscription, Booking, Customer, Payment, BookingSlot, SubscriptionStatus, PaymentMethod, PaymentKind } from "../types";
-import { getFirestore, setDoc, doc, collection, addDoc, getDocs, query, where, writeBatch, serverTimestamp, deleteDoc } from "firebase/firestore";
+import { getFirestore, setDoc, doc, collection, addDoc, getDocs, query, where, writeBatch, serverTimestamp, deleteDoc, onSnapshot } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../lib/firebase";
 import { getRomeTodayString, adjustDateString, formatItalianDate } from "../utils";
-import { UserPlus, Calendar, Plus, Trash2, ShieldAlert, CreditCard, CheckCircle, Clock, AlertCircle } from "lucide-react";
+import { UserPlus, Calendar, Plus, Trash2, ShieldAlert, CreditCard, CheckCircle, Clock, AlertCircle, Save } from "lucide-react";
 
 interface SubscriptionsModuleProps {
   subscriptions: Subscription[];
   bookings: Booking[];
   payments: Payment[];
   onRefresh: () => void;
+  preSelectedSubId?: string | null;
+  onClearPreSelectedSubId?: () => void;
 }
 
-export default function SubscriptionsModule({ subscriptions, bookings, payments, onRefresh }: SubscriptionsModuleProps) {
+export default function SubscriptionsModule({
+  subscriptions,
+  bookings,
+  payments,
+  onRefresh,
+  preSelectedSubId,
+  onClearPreSelectedSubId
+}: SubscriptionsModuleProps) {
   const [activeTab, setActiveTab] = useState<"list" | "new">("list");
   const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -34,6 +43,107 @@ export default function SubscriptionsModule({ subscriptions, bookings, payments,
   const [payAmount, setPayAmount] = useState<number>(0);
   const [payMethod, setPayMethod] = useState<PaymentMethod>("cash");
   const [payKind, setPayKind] = useState<PaymentKind>("full");
+
+  // Subscriber live editable notes (B2)
+  const [subNotes, setSubNotes] = useState("");
+  const [savingNotes, setSavingNotes] = useState(false);
+
+  // Payments loaded on-demand for the selected subscriber (A3, B2)
+  const [selectedSubPayments, setSelectedSubPayments] = useState<Payment[]>([]);
+
+  // Listen to selected subscriber payments on-demand (A3, B2)
+  useEffect(() => {
+    if (!selectedSub || !selectedSub.id) {
+      setSelectedSubPayments([]);
+      return;
+    }
+    const q = query(
+      collection(db, "payments"),
+      where("subscriptionId", "==", selectedSub.id)
+    );
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const list: Payment[] = [];
+      snapshot.forEach((doc) => {
+        list.push({ id: doc.id, ...doc.data() } as Payment);
+      });
+      setSelectedSubPayments(list);
+    }, (err) => console.error("On-demand sub payments error:", err));
+    return () => unsubscribe();
+  }, [selectedSub]);
+
+  // Cancelled subscriptions loaded on-demand for history (A3)
+  const [cancelledSubs, setCancelledSubs] = useState<Subscription[]>([]);
+  const [showCancelled, setShowCancelled] = useState(false);
+  const [loadingCancelled, setLoadingCancelled] = useState(false);
+
+  // Fetch cancelled subscriptions on-demand (A3)
+  useEffect(() => {
+    if (showCancelled) {
+      setLoadingCancelled(true);
+      const q = query(
+        collection(db, "subscriptions"),
+        where("status", "==", "cancelled")
+      );
+      getDocs(q)
+        .then((snapshot) => {
+          const list: Subscription[] = [];
+          snapshot.forEach((doc) => {
+            list.push({ id: doc.id, ...doc.data() } as Subscription);
+          });
+          setCancelledSubs(list);
+          setLoadingCancelled(false);
+        })
+        .catch((err) => {
+          console.error("Error loading cancelled subs on-demand:", err);
+          setLoadingCancelled(false);
+        });
+    } else {
+      setCancelledSubs([]);
+    }
+  }, [showCancelled]);
+
+  // Sync selection when navigated from another tab (B1/B2)
+  useEffect(() => {
+    if (preSelectedSubId) {
+      const match = subscriptions.find((s) => s.id === preSelectedSubId);
+      if (match) {
+        setSelectedSub(match);
+        setActiveTab("list");
+        if (onClearPreSelectedSubId) {
+          onClearPreSelectedSubId();
+        }
+      }
+    }
+  }, [preSelectedSubId, subscriptions]);
+
+  // Sync editable notes when selectedSub changes (B2)
+  useEffect(() => {
+    if (selectedSub) {
+      setSubNotes(selectedSub.notes || "");
+    } else {
+      setSubNotes("");
+    }
+  }, [selectedSub]);
+
+  // Save updated notes to DB (B2)
+  const handleSaveSubNotes = async () => {
+    if (!selectedSub) return;
+    setSavingNotes(true);
+    try {
+      const subRef = doc(db, "subscriptions", selectedSub.id!);
+      await setDoc(subRef, { notes: subNotes }, { merge: true });
+      
+      // Update local state copy to avoid lagging feel
+      setSelectedSub(prev => prev ? { ...prev, notes: subNotes } : null);
+      
+      onRefresh();
+    } catch (err) {
+      console.error(err);
+      setErrorMessage("Errore nel salvataggio delle note dell'abbonato.");
+    } finally {
+      setSavingNotes(false);
+    }
+  };
 
   // Helper to get all dates between two dates matching days of week
   const getDatesInRange = (startStr: string, endStr: string, days?: number[]): string[] => {
@@ -129,8 +239,8 @@ export default function SubscriptionsModule({ subscriptions, bookings, payments,
         throw new Error(`Conflitto di prenotazione rilevato! Risolvi le sovrapposizioni prima di procedere.`);
       }
 
-      // 3. Setup Customer
-      const custId = `cust_${Date.now()}`;
+      // 3. Setup Customer (A5)
+      const custId = doc(collection(db, "customers")).id;
       const customerRef = doc(db, "customers", custId);
       await setDoc(customerRef, {
         name: customerName,
@@ -139,8 +249,8 @@ export default function SubscriptionsModule({ subscriptions, bookings, payments,
         notes: customerNotes
       });
 
-      // 4. Save Subscription
-      const subId = `sub_${Date.now()}`;
+      // 4. Save Subscription (A5)
+      const subId = doc(collection(db, "subscriptions")).id;
       const subscriptionRef = doc(db, "subscriptions", subId);
       
       const subscriptionData: Subscription = {
@@ -153,7 +263,8 @@ export default function SubscriptionsModule({ subscriptions, bookings, payments,
         slot,
         daysOfWeek: selectedDays.length > 0 ? selectedDays : undefined,
         priceTotal,
-        status: "active"
+        status: "active",
+        notes: customerNotes
       };
 
       await setDoc(subscriptionRef, subscriptionData);
@@ -270,9 +381,13 @@ export default function SubscriptionsModule({ subscriptions, bookings, payments,
     }
   };
 
-  // Helper to calculate total payments and remaining balance
+  // Helper to calculate total payments and remaining balance (A3, B2)
   const getSubFinanceDetails = (subId: string, priceTotal: number) => {
-    const subPayments = payments.filter((p) => p.subscriptionId === subId);
+    const isSelected = selectedSub?.id === subId;
+    const subPayments = isSelected 
+      ? selectedSubPayments 
+      : payments.filter((p) => p.subscriptionId === subId);
+
     const paidSum = subPayments.reduce((sum, p) => sum + p.amount, 0);
     const balance = priceTotal - paidSum;
     
@@ -305,29 +420,47 @@ export default function SubscriptionsModule({ subscriptions, bookings, payments,
       <div className="lg:col-span-2 bg-white rounded-2xl border border-slate-100 p-6 shadow-sm flex flex-col h-full min-h-[600px]">
         
         {/* Tabs Headers */}
-        <div className="flex border-b border-slate-100 mb-6">
-          <button
-            id="tab-sub-list"
-            onClick={() => { setActiveTab("list"); setErrorMessage(null); }}
-            className={`pb-3 text-sm font-semibold px-4 transition-all border-b-2 ${
-              activeTab === "list" 
-                ? "border-blue-600 text-blue-600" 
-                : "border-transparent text-slate-500 hover:text-slate-800"
-            }`}
-          >
-            Lista Abbonati ({subscriptions.length})
-          </button>
-          <button
-            id="tab-sub-new"
-            onClick={() => { setActiveTab("new"); setErrorMessage(null); }}
-            className={`pb-3 text-sm font-semibold px-4 transition-all border-b-2 ${
-              activeTab === "new" 
-                ? "border-blue-600 text-blue-600" 
-                : "border-transparent text-slate-500 hover:text-slate-800"
-            }`}
-          >
-            Nuovo Abbonamento
-          </button>
+        <div className="flex justify-between items-center border-b border-slate-100 mb-6 flex-wrap gap-2">
+          <div className="flex">
+            <button
+              id="tab-sub-list"
+              onClick={() => { setActiveTab("list"); setErrorMessage(null); }}
+              className={`pb-3 text-sm font-semibold px-4 transition-all border-b-2 ${
+                activeTab === "list" 
+                  ? "border-blue-600 text-blue-600" 
+                  : "border-transparent text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              Lista Abbonati ({subscriptions.length})
+            </button>
+            <button
+              id="tab-sub-new"
+              onClick={() => { setActiveTab("new"); setErrorMessage(null); }}
+              className={`pb-3 text-sm font-semibold px-4 transition-all border-b-2 ${
+                activeTab === "new" 
+                  ? "border-blue-600 text-blue-600" 
+                  : "border-transparent text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              Nuovo Abbonamento
+            </button>
+          </div>
+
+          {activeTab === "list" && (
+            <button
+              id="btn-toggle-show-cancelled"
+              onClick={() => setShowCancelled(!showCancelled)}
+              className={`pb-2 mb-1 text-xs font-bold px-3 py-1 rounded-lg border transition-all flex items-center gap-1 cursor-pointer ${
+                showCancelled
+                  ? "bg-slate-100 text-slate-800 border-slate-300"
+                  : "bg-white text-slate-500 border-slate-200 hover:text-slate-800"
+              }`}
+            >
+              <Clock className="w-3.5 h-3.5" />
+              {showCancelled ? "Nascondi Disdetti" : "Mostra Disdetti / Storico"}
+              {loadingCancelled && "..."}
+            </button>
+          )}
         </div>
 
         {errorMessage && (
@@ -337,88 +470,100 @@ export default function SubscriptionsModule({ subscriptions, bookings, payments,
           </div>
         )}
 
-        {/* Tab 1: LIST */}
+        {/* Tab 1: LIST (Grid of compact cards) (B2) */}
         {activeTab === "list" && (
           <div className="flex-1 overflow-y-auto">
-            {subscriptions.length === 0 ? (
-              <div className="text-center py-16 text-slate-400">
-                <UserPlus className="w-12 h-12 mx-auto stroke-1 mb-2 text-slate-300" />
-                <p className="font-semibold text-sm">Nessun abbonamento attivo</p>
-                <p className="text-xs">Usa il pannello a destra per registrarne uno.</p>
-              </div>
-            ) : (
-              <div className="overflow-x-auto">
-                <table id="sub-list-table" className="w-full text-left border-collapse text-xs md:text-sm">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-100 text-slate-500 font-semibold uppercase text-[10px]">
-                      <th className="p-3">Abbonato</th>
-                      <th className="p-3">Lettini</th>
-                      <th className="p-3">Periodo</th>
-                      <th className="p-3">Slot</th>
-                      <th className="p-3">Giorni Residui</th>
-                      <th className="p-3">Stato Pagamento</th>
-                      <th className="p-3">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 text-slate-700">
-                    {subscriptions.map((sub) => {
-                      const { paidSum, balance, payStatus } = getSubFinanceDetails(sub.id!, sub.priceTotal);
-                      const remDays = getSubRemainingDays(sub.endDate);
-                      const isSelected = selectedSub?.id === sub.id;
+            {(() => {
+              const displayedSubs = showCancelled 
+                ? [...subscriptions, ...cancelledSubs] 
+                : subscriptions;
 
-                      return (
-                        <tr
-                          key={sub.id}
-                          id={`sub-row-${sub.id}`}
-                          onClick={() => setSelectedSub(sub)}
-                          className={`cursor-pointer transition-colors ${
-                            isSelected ? "bg-blue-50/50" : "hover:bg-slate-50/50"
-                          }`}
-                        >
-                          <td className="p-3 font-semibold text-slate-800">{sub.customerName}</td>
-                          <td className="p-3">
-                            <span className="bg-slate-100 text-slate-800 px-1.5 py-0.5 rounded font-mono font-bold text-xs">
-                              {sub.bedNumbers.join(", ")}
-                            </span>
-                          </td>
-                          <td className="p-3 text-slate-500 whitespace-nowrap">
+              if (displayedSubs.length === 0) {
+                return (
+                  <div className="text-center py-16 text-slate-400">
+                    <UserPlus className="w-12 h-12 mx-auto stroke-1 mb-2 text-slate-300" />
+                    <p className="font-semibold text-sm">Nessun abbonamento trovato</p>
+                    <p className="text-xs">Usa il pannello a destra per registrarne uno.</p>
+                  </div>
+                );
+              }
+
+              return (
+                <div id="sub-grid-container" className="grid grid-cols-1 md:grid-cols-2 gap-4 pb-4">
+                  {displayedSubs.map((sub) => {
+                  const { paidSum, balance, payStatus } = getSubFinanceDetails(sub.id!, sub.priceTotal);
+                  const remDays = getSubRemainingDays(sub.endDate);
+                  const isSelected = selectedSub?.id === sub.id;
+
+                  return (
+                    <div
+                      key={sub.id}
+                      id={`sub-card-${sub.id}`}
+                      onClick={() => setSelectedSub(sub)}
+                      className={`p-4 rounded-xl border transition-all cursor-pointer flex flex-col justify-between gap-3 shadow-sm ${
+                        isSelected
+                          ? "bg-blue-50/50 border-blue-400 ring-1 ring-blue-400"
+                          : "bg-white border-slate-100 hover:border-slate-300 hover:shadow-md"
+                      }`}
+                    >
+                      {/* Title & Bed numbers */}
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <h4 className="font-bold text-slate-800 text-sm">{sub.customerName}</h4>
+                          <span className="text-[10px] text-slate-400 font-semibold block mt-1">
                             {sub.startDate} al {sub.endDate}
-                          </td>
-                          <td className="p-3 text-slate-500 capitalize">
-                            {sub.slot === "full_day" ? "Intero" : sub.slot === "morning" ? "Mattina" : "Pomeriggio"}
-                          </td>
-                          <td className="p-3 font-medium text-slate-600">
-                            {remDays} gg
-                          </td>
-                          <td className="p-3">
-                            {payStatus === "paid" ? (
-                              <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-700 uppercase bg-emerald-100 px-1.5 py-0.5 rounded">
-                                Saldato
-                              </span>
-                            ) : payStatus === "partial" ? (
-                              <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-700 uppercase bg-amber-100 px-1.5 py-0.5 rounded">
-                                Acconto ({balance}€ residui)
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center gap-1 text-[10px] font-bold text-rose-700 uppercase bg-rose-100 px-1.5 py-0.5 rounded">
-                                Non Pagato ({sub.priceTotal}€)
-                              </span>
-                            )}
-                          </td>
-                          <td className="p-3">
-                            {sub.status === "active" ? (
-                              <span className="text-xs text-emerald-600 font-semibold uppercase">Attivo</span>
-                            ) : (
-                              <span className="text-xs text-slate-400 font-semibold uppercase">Cancellato</span>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                          </span>
+                        </div>
+                        <span className="bg-blue-50 text-blue-700 px-2 py-0.5 rounded-lg font-mono font-black text-xs">
+                          {sub.bedNumbers.join(", ")}
+                        </span>
+                      </div>
+
+                      {/* Period and days remaining */}
+                      <div className="flex justify-between items-center text-xs text-slate-500">
+                        <span className="capitalize font-semibold text-slate-400">
+                          {sub.slot === "full_day" ? "Giornata" : sub.slot === "morning" ? "Mattina" : "Pomeriggio"}
+                        </span>
+                        <span className={`font-bold text-slate-600 bg-slate-50 px-2 py-1 rounded-md flex items-center gap-1 ${
+                          remDays === 0 ? "text-rose-600 bg-rose-50" : ""
+                        }`}>
+                          <Clock className="w-3.5 h-3.5 text-slate-400" />
+                          {remDays} gg residui
+                        </span>
+                      </div>
+
+                      {/* Payment Status badge & residual */}
+                      <div className="flex items-center justify-between border-t border-slate-100 pt-3 mt-1">
+                        <div>
+                          {payStatus === "paid" ? (
+                            <span className="text-[9px] font-black tracking-wider uppercase bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full">
+                              Saldato
+                            </span>
+                          ) : payStatus === "partial" ? (
+                            <span className="text-[9px] font-black tracking-wider uppercase bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">
+                              Acconto
+                            </span>
+                          ) : (
+                            <span className="text-[9px] font-black tracking-wider uppercase bg-rose-100 text-rose-800 px-2 py-0.5 rounded-full">
+                              Non Pagato
+                            </span>
+                          )}
+                          {sub.status === "cancelled" && (
+                            <span className="text-[9px] font-black tracking-wider uppercase bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full ml-1">
+                              Disdetto
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-xs font-black text-slate-700">
+                          {balance > 0 ? `Residuo: ${balance}€` : "Saldato"}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-            )}
+            );
+          })()}
           </div>
         )}
 
@@ -643,6 +788,30 @@ export default function SubscriptionsModule({ subscriptions, bookings, payments,
                     <Calendar className="w-3.5 h-3.5 text-slate-400" />
                     dal {selectedSub.startDate} al {selectedSub.endDate}
                   </span>
+                </div>
+              </div>
+
+              {/* Note dell'abbonato modificabili (B2) */}
+              <div className="space-y-1.5 bg-slate-50 p-4 rounded-xl text-xs">
+                <span className="font-bold text-slate-500 uppercase tracking-wider block">Note dell'Abbonato</span>
+                <div className="flex gap-2">
+                  <textarea
+                    id="sub-notes-edit-textarea"
+                    rows={2}
+                    placeholder="Note particolari dell'abbonato..."
+                    value={subNotes}
+                    onChange={(e) => setSubNotes(e.target.value)}
+                    className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-semibold resize-none text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                  <button
+                    id="btn-sub-notes-save"
+                    onClick={handleSaveSubNotes}
+                    disabled={savingNotes || subNotes === (selectedSub.notes || "")}
+                    className="px-3 bg-blue-50 hover:bg-blue-100 text-blue-600 rounded-lg border border-blue-100 font-bold transition-all disabled:opacity-50 flex items-center justify-center cursor-pointer"
+                    title="Salva Note Abbonato"
+                  >
+                    {savingNotes ? "..." : <Save className="w-4 h-4" />}
+                  </button>
                 </div>
               </div>
 

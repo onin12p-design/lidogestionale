@@ -24,6 +24,7 @@ export interface Subscription {
   daysOfWeek?: number[]; // [0,6]
   priceTotal: number;
   status: SubscriptionStatus;
+  notes?: string;
 }
 
 export interface Booking {

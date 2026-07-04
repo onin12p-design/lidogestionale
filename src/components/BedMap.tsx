@@ -35,17 +35,33 @@ const PEDANA_DESTRA_RIGHT = [
 ];
 
 interface BedMapProps {
-  bookings: Booking[];
-  tabs: Tab[];
-  payments: Payment[];
-  onBedSelect: (bedNumber: number) => void;
-  selectedBed: number | null;
+  bookings?: Booking[];
+  tabs?: Tab[];
+  payments?: Payment[];
+  onBedSelect?: (bedNumber: number) => void;
+  selectedBed?: number | null;
+  isClientView?: boolean;
+  availability?: { bedNumber: number; status: "free" | "morning_free" | "afternoon_free" | "full" }[];
 }
 
-export default function BedMap({ bookings, tabs, payments, onBedSelect, selectedBed }: BedMapProps) {
+export default function BedMap({
+  bookings = [],
+  tabs = [],
+  payments = [],
+  onBedSelect,
+  selectedBed = null,
+  isClientView = false,
+  availability = []
+}: BedMapProps) {
   
   // Helper to get booking details for a bed number
   const getBedBookingStatus = (bedNum: number) => {
+    if (isClientView) {
+      const found = availability.find((a) => a.bedNumber === bedNum);
+      const status = found ? found.status : "free";
+      return { state: status, isSubscriber: false, bookingsOnBed: [] };
+    }
+
     const bedBookings = bookings.filter((b) => b.bedNumber === bedNum);
     if (bedBookings.length === 0) return { state: "free", bookingsOnBed: [] };
 
@@ -70,31 +86,25 @@ export default function BedMap({ bookings, tabs, payments, onBedSelect, selected
 
   // Helper to get payment and tab indicator for a bed
   const getBedIndicators = (bedNum: number, bookingsOnBed: Booking[]) => {
-    if (bookingsOnBed.length === 0) return { payment: "none", hasOpenTab: false };
+    if (isClientView || bookingsOnBed.length === 0) return { payment: "none", hasOpenTab: false };
 
     // Check tabs
     const bedTabs = tabs.filter((t) => t.bedNumber === bedNum && !t.paid);
     const hasOpenTab = bedTabs.length > 0 && bedTabs.some(t => t.items.length > 0);
 
     // Calculate payments
-    // We look at payments recorded for these booking IDs or subscription IDs
     let totalPaid = 0;
     let expectedPrice = 0;
 
     bookingsOnBed.forEach(booking => {
-      // Find payments directly for this booking
       const bPayments = payments.filter(p => p.bookingId === booking.id);
       bPayments.forEach(p => totalPaid += p.amount);
 
-      // Find payments for parent subscription
       if (booking.subscriptionId) {
         const sPayments = payments.filter(p => p.subscriptionId === booking.subscriptionId);
-        // Note: we can allocate a proportional payment or look at whether subscription is saldato
         sPayments.forEach(p => totalPaid += p.amount);
       }
 
-      // Default estimated prices if custom is not registered:
-      // Morning = 15, Afternoon = 15, Full_day = 30
       if (booking.slot === "full_day") expectedPrice += 30;
       else expectedPrice += 15;
     });
@@ -115,7 +125,6 @@ export default function BedMap({ bookings, tabs, payments, onBedSelect, selected
 
   const renderBedCell = (bedNum: number | null) => {
     if (bedNum === null) {
-      // Empty cell (for the missing space in leftmost grid)
       return <div key="null-cell" className="w-10 h-10 md:w-12 md:h-12 bg-transparent"></div>;
     }
 
@@ -126,21 +135,39 @@ export default function BedMap({ bookings, tabs, payments, onBedSelect, selected
     let bgClass = "bg-white border-slate-200 hover:border-blue-400";
     let textClass = "text-slate-700";
 
-    if (state === "full_day" || state === "split_full_day") {
-      bgClass = isSubscriber 
-        ? "bg-purple-100 border-purple-300 hover:bg-purple-200" 
-        : "bg-emerald-100 border-emerald-300 hover:bg-emerald-200";
-      textClass = isSubscriber ? "text-purple-900 font-semibold" : "text-emerald-900 font-semibold";
-    } else if (state === "morning") {
-      bgClass = isSubscriber
-        ? "bg-gradient-to-b from-purple-100 via-purple-50 to-white border-purple-300"
-        : "bg-gradient-to-b from-amber-100 via-amber-50 to-white border-amber-300";
-      textClass = isSubscriber ? "text-purple-900" : "text-amber-900";
-    } else if (state === "afternoon") {
-      bgClass = isSubscriber
-        ? "bg-gradient-to-t from-purple-100 via-purple-50 to-white border-purple-300"
-        : "bg-gradient-to-t from-sky-100 via-sky-50 to-white border-sky-300";
-      textClass = isSubscriber ? "text-purple-900" : "text-sky-900";
+    if (isClientView) {
+      if (state === "free") {
+        bgClass = "bg-white border-slate-200 cursor-default";
+        textClass = "text-slate-700";
+      } else if (state === "morning_free") {
+        // Afternoon occupied, morning free
+        bgClass = "bg-gradient-to-t from-sky-100 via-sky-50 to-white border-sky-200 cursor-default";
+        textClass = "text-sky-950 font-bold";
+      } else if (state === "afternoon_free") {
+        // Morning occupied, afternoon free
+        bgClass = "bg-gradient-to-b from-amber-100 via-amber-50 to-white border-amber-200 cursor-default";
+        textClass = "text-amber-950 font-bold";
+      } else if (state === "full") {
+        bgClass = "bg-slate-200 border-slate-300 cursor-default";
+        textClass = "text-slate-500 font-semibold";
+      }
+    } else {
+      if (state === "full_day" || state === "split_full_day") {
+        bgClass = isSubscriber 
+          ? "bg-purple-100 border-purple-300 hover:bg-purple-200" 
+          : "bg-emerald-100 border-emerald-300 hover:bg-emerald-200";
+        textClass = isSubscriber ? "text-purple-900 font-semibold" : "text-emerald-900 font-semibold";
+      } else if (state === "morning") {
+        bgClass = isSubscriber
+          ? "bg-gradient-to-b from-purple-100 via-purple-50 to-white border-purple-300"
+          : "bg-gradient-to-b from-amber-100 via-amber-50 to-white border-amber-300";
+        textClass = isSubscriber ? "text-purple-900" : "text-amber-900";
+      } else if (state === "afternoon") {
+        bgClass = isSubscriber
+          ? "bg-gradient-to-t from-purple-100 via-purple-50 to-white border-purple-300"
+          : "bg-gradient-to-t from-sky-100 via-sky-50 to-white border-sky-300";
+        textClass = isSubscriber ? "text-purple-900" : "text-sky-900";
+      }
     }
 
     const selectedClass = isSelected 
@@ -151,36 +178,37 @@ export default function BedMap({ bookings, tabs, payments, onBedSelect, selected
       <button
         key={`bed-${bedNum}`}
         id={`btn-bed-${bedNum}`}
-        onClick={() => onBedSelect(bedNum)}
+        onClick={() => !isClientView && onBedSelect && onBedSelect(bedNum)}
+        disabled={isClientView}
         className={`w-10 h-10 md:w-12 md:h-12 border rounded-lg flex flex-col items-center justify-center relative transition-all duration-150 ${bgClass} ${textClass} ${selectedClass}`}
       >
         <span className="text-xs md:text-sm font-bold">{bedNum}</span>
         
         {/* Indicators bar */}
-        <div className="absolute bottom-1 flex gap-1 items-center justify-center w-full px-1">
-          {/* Payment indicator */}
-          {state !== "free" && (
-            <span
-              id={`payment-dot-${bedNum}`}
-              className={`w-1.5 h-1.5 rounded-full ${
-                payment === "paid" 
-                  ? "bg-emerald-500" 
-                  : payment === "deposit" 
-                  ? "bg-amber-400" 
-                  : "bg-rose-500"
-              }`}
-              title={payment === "paid" ? "Saldato" : payment === "deposit" ? "Acconto" : "Non pagato"}
-            />
-          )}
+        {!isClientView && (
+          <div className="absolute bottom-1 flex gap-1 items-center justify-center w-full px-1">
+            {state !== "free" && (
+              <span
+                id={`payment-dot-${bedNum}`}
+                className={`w-1.5 h-1.5 rounded-full ${
+                  payment === "paid" 
+                    ? "bg-emerald-500" 
+                    : payment === "deposit" 
+                    ? "bg-amber-400" 
+                    : "bg-rose-500"
+                }`}
+                title={payment === "paid" ? "Saldato" : payment === "deposit" ? "Acconto" : "Non pagato"}
+              />
+            )}
 
-          {/* Open tab indicator */}
-          {hasOpenTab && (
-            <Coffee id={`tab-icon-${bedNum}`} className="w-2.5 h-2.5 text-amber-600" title="Consumazioni aperte" />
-          )}
-        </div>
+            {hasOpenTab && (
+              <Coffee id={`tab-icon-${bedNum}`} className="w-2.5 h-2.5 text-amber-600" title="Consumazioni aperte" />
+            )}
+          </div>
+        )}
 
         {/* Small badge for subscriber */}
-        {isSubscriber && state !== "free" && (
+        {!isClientView && isSubscriber && state !== "free" && (
           <span className="absolute top-0.5 right-0.5 w-1 h-1 rounded-full bg-purple-600" title="Abbonato" />
         )}
       </button>
@@ -191,44 +219,65 @@ export default function BedMap({ bookings, tabs, payments, onBedSelect, selected
     <div id="beach-map-container" className="flex flex-col gap-8 w-full select-none">
       
       {/* Legend */}
-      <div id="map-legend" className="flex flex-wrap gap-4 items-center justify-center p-3 bg-slate-50 rounded-xl border border-slate-100 text-xs text-slate-600">
-        <div className="flex items-center gap-1.5">
-          <div className="w-4 h-4 bg-white border border-slate-200 rounded"></div>
-          <span>Libero</span>
+      {isClientView ? (
+        <div id="map-legend" className="flex flex-wrap gap-4 items-center justify-center p-3 bg-slate-50 rounded-xl border border-slate-100 text-xs text-slate-600">
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-white border border-slate-200 rounded"></div>
+            <span>Libero</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-gradient-to-t from-sky-100 to-white border border-sky-300 rounded"></div>
+            <span>Parzialmente occupato (Mattina Libera)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-gradient-to-b from-amber-100 to-white border border-amber-300 rounded"></div>
+            <span>Parzialmente occupato (Pomeriggio Libero)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-slate-200 border border-slate-300 rounded"></div>
+            <span>Occupato</span>
+          </div>
         </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-4 h-4 bg-emerald-100 border border-emerald-300 rounded"></div>
-          <span>Giornaliero Intero</span>
+      ) : (
+        <div id="map-legend" className="flex flex-wrap gap-4 items-center justify-center p-3 bg-slate-50 rounded-xl border border-slate-100 text-xs text-slate-600">
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-white border border-slate-200 rounded"></div>
+            <span>Libero</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-emerald-100 border border-emerald-300 rounded"></div>
+            <span>Giornaliero Intero</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-purple-100 border border-purple-300 rounded"></div>
+            <span>Abbonato</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-gradient-to-b from-amber-100 to-white border border-amber-300 rounded"></div>
+            <span>Occupato Mattina (AM)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 bg-gradient-to-t from-sky-100 to-white border border-sky-300 rounded"></div>
+            <span>Occupato Pomeriggio (PM)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full bg-emerald-500"></div>
+            <span>Saldato</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full bg-amber-400"></div>
+            <span>Acconto</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full bg-rose-500"></div>
+            <span>Non Pagato</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Coffee className="w-3.5 h-3.5 text-amber-600" />
+            <span>Tab Consumazioni</span>
+          </div>
         </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-4 h-4 bg-purple-100 border border-purple-300 rounded"></div>
-          <span>Abbonato</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-4 h-4 bg-gradient-to-b from-amber-100 to-white border border-amber-300 rounded"></div>
-          <span>Occupato Mattina (AM)</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-4 h-4 bg-gradient-to-t from-sky-100 to-white border border-sky-300 rounded"></div>
-          <span>Occupato Pomeriggio (PM)</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-full bg-emerald-500"></div>
-          <span>Saldato</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-full bg-amber-400"></div>
-          <span>Acconto</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-full bg-rose-500"></div>
-          <span>Non Pagato</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <Coffee className="w-3.5 h-3.5 text-amber-600" />
-          <span>Tab Consumazioni</span>
-        </div>
-      </div>
+      )}
 
       {/* Grid Layout of Pedane */}
       <div id="pedane-grid" className="flex flex-col lg:flex-row gap-8 justify-center items-start w-full overflow-x-auto pb-4">

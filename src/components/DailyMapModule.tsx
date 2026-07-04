@@ -1,10 +1,10 @@
 import React, { useState } from "react";
 import { Booking, Tab, Payment, BookingSlot, CustomerType, PaymentMethod, PaymentKind } from "../types";
 import { getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "firebase/firestore";
-import { db, handleFirestoreError, OperationType } from "../lib/firebase";
+import { db, handleFirestoreError, OperationType, createBookingTransactional } from "../lib/firebase";
 import { getRomeTodayString, adjustDateString, formatItalianDate, isValidBedNumber } from "../utils";
 import BedMap from "./BedMap";
-import { Calendar, ChevronLeft, ChevronRight, Search, Plus, Trash2, CreditCard, Coffee, Check, AlertCircle, Info } from "lucide-react";
+import { Calendar, ChevronLeft, ChevronRight, Search, Plus, Trash2, CreditCard, Coffee, Check, AlertCircle, Info, Users, Save, Clock } from "lucide-react";
 
 interface DailyMapModuleProps {
   currentDate: string;
@@ -13,10 +13,22 @@ interface DailyMapModuleProps {
   tabs: Tab[];
   payments: Payment[];
   onRefresh: () => void;
+  selectedBed: number | null;
+  setSelectedBed: (bed: number | null) => void;
+  onOpenSubscriberCard?: (subId: string) => void;
 }
 
-export default function DailyMapModule({ currentDate, onDateChange, bookings, tabs, payments, onRefresh }: DailyMapModuleProps) {
-  const [selectedBed, setSelectedBed] = useState<number | null>(null);
+export default function DailyMapModule({
+  currentDate,
+  onDateChange,
+  bookings,
+  tabs,
+  payments,
+  onRefresh,
+  selectedBed,
+  setSelectedBed,
+  onOpenSubscriberCard
+}: DailyMapModuleProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -37,6 +49,9 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
   const [tabLabel, setTabLabel] = useState("");
   const [tabPrice, setTabPrice] = useState<number>(0);
   const [tabQty, setTabQty] = useState<number>(1);
+
+  // Active editable notes state (B1)
+  const [activeNotes, setActiveNotes] = useState<Record<string, string>>({});
 
   // Search Filtered Bookings & Beds
   const getFilteredBookings = () => {
@@ -84,12 +99,19 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
 
   const freeSlots = getFreeSlotsForSelectedBed();
 
-  // Auto set slot when selectedBed changes or slots computed
+  // Auto set slot when selectedBed changes or slots computed, and sync active notes
   React.useEffect(() => {
     if (freeSlots.length > 0) {
       setBookSlot(freeSlots[0]);
       setBookPrice(freeSlots[0] === "full_day" ? 30 : 15);
     }
+    
+    // Synchronize interactive notes
+    const notesMap: Record<string, string> = {};
+    selectedBedBookings.forEach((b) => {
+      notesMap[b.id] = b.notes || "";
+    });
+    setActiveNotes(notesMap);
   }, [selectedBed, bookings]);
 
   // Navigate dates
@@ -108,7 +130,7 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
     setSelectedBed(null);
   };
 
-  // Perform quick booking
+  // Perform quick booking (A1, A5)
   const handleQuickBook = async (e: React.FormEvent) => {
     e.preventDefault();
     if (selectedBed === null || !custName.trim()) return;
@@ -117,8 +139,8 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
     setErrorMessage(null);
 
     try {
-      // Create Customer document
-      const custId = `cust_${Date.now()}`;
+      // Create Customer document with standard secure ID (A5)
+      const custId = doc(collection(db, "customers")).id;
       const customerRef = doc(db, "customers", custId);
       await setDoc(customerRef, {
         name: custName,
@@ -126,11 +148,8 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
         notes: bookNotes
       });
 
-      // Deterministic booking ID: date_bedNumber_slot
-      const bookingId = `${currentDate}_${selectedBed}_${bookSlot}`;
-      const bookingRef = doc(db, "bookings", bookingId);
-
-      await setDoc(bookingRef, {
+      // Use the transactional helper for double-booking protection (A1)
+      const result = await createBookingTransactional({
         bedNumber: selectedBed,
         date: currentDate,
         slot: bookSlot,
@@ -138,9 +157,13 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
         customerName: custName,
         customerType: custType,
         source: "manual",
-        notes: bookNotes,
-        createdAt: serverTimestamp()
+        notes: bookNotes
       });
+
+      if (!result.success) {
+        setErrorMessage(result.error || "Conflitto rilevato. Impossibile creare la prenotazione.");
+        return;
+      }
 
       // Reset form
       setCustName("");
@@ -148,7 +171,7 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
       onRefresh();
     } catch (err: any) {
       console.error(err);
-      setErrorMessage("Errore nel salvare la prenotazione.");
+      setErrorMessage(err.message || "Errore nel salvare la prenotazione.");
     } finally {
       setSaving(false);
     }
@@ -413,11 +436,51 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
                         </span>
                       </div>
 
-                      {/* Notes */}
-                      {booking.notes && (
-                        <p className="text-xs text-slate-500 italic bg-white p-2 rounded border border-slate-100">
-                          {booking.notes}
-                        </p>
+                      {/* Interactive Notes & Save (B1) */}
+                      <div className="space-y-1 bg-white p-2.5 rounded-lg border border-slate-100 shadow-sm">
+                        <span className="text-[9px] font-bold text-slate-400 uppercase block">Note del Lettino</span>
+                        <div className="flex gap-1.5">
+                          <textarea
+                            id={`textarea-notes-bed-${booking.id}`}
+                            rows={2}
+                            placeholder="Aggiungi note per questo lettino..."
+                            value={activeNotes[booking.id] || ""}
+                            onChange={(e) => setActiveNotes(prev => ({ ...prev, [booking.id]: e.target.value }))}
+                            className="flex-1 px-2.5 py-1.5 bg-slate-50 border border-slate-100 rounded-lg text-xs text-slate-700 resize-none font-medium focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-500 transition-all"
+                          />
+                          <button
+                            id={`btn-save-notes-${booking.id}`}
+                            onClick={async () => {
+                              setSaving(true);
+                              try {
+                                const ref = doc(db, "bookings", booking.id);
+                                await setDoc(ref, { notes: activeNotes[booking.id] || "" }, { merge: true });
+                                onRefresh();
+                              } catch (e) {
+                                console.error(e);
+                              } finally {
+                                setSaving(false);
+                              }
+                            }}
+                            disabled={saving || (activeNotes[booking.id] || "") === (booking.notes || "")}
+                            className="px-2.5 bg-blue-50 text-blue-600 border border-blue-100 rounded-lg hover:bg-blue-100 disabled:opacity-50 transition-colors flex items-center justify-center cursor-pointer"
+                            title="Salva Note"
+                          >
+                            <Save className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Link to subscriber (B1) */}
+                      {booking.subscriptionId && onOpenSubscriberCard && (
+                        <button
+                          id={`btn-link-sub-${booking.id}`}
+                          onClick={() => onOpenSubscriberCard(booking.subscriptionId!)}
+                          className="w-full py-1.5 bg-purple-50 hover:bg-purple-100 border border-purple-100 text-purple-700 font-bold text-xs rounded-lg flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <Users className="w-3.5 h-3.5" />
+                          <span>Vai alla card abbonato</span>
+                        </button>
                       )}
 
                       {/* Finance info */}
@@ -545,11 +608,53 @@ export default function DailyMapModule({ currentDate, onDateChange, bookings, ta
                         </div>
                       </div>
 
+                      {/* Storico del Giorno (B1) */}
+                      <div className="space-y-2 border-t border-slate-200/50 pt-3">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block flex items-center gap-1.5">
+                          <Clock className="w-3.5 h-3.5 text-slate-400" />
+                          Storico del Giorno
+                        </span>
+                        {(() => {
+                          const events: string[] = [];
+                          
+                          events.push(`Prenotazione creata: ${booking.source === "subscription" ? "Abbonamento" : "Manuale"} (${booking.slot === "full_day" ? "Giornata Intera" : booking.slot === "morning" ? "Mattina" : "Pomeriggio"})`);
+                          
+                          // Payments for this booking
+                          const directPayments = payments.filter(p => p.bookingId === booking.id);
+                          directPayments.forEach(p => {
+                            events.push(`Incasso: +${p.amount}€ via ${p.method === "cash" ? "Contanti" : "Carta"}`);
+                          });
+
+                          // Tab consumations
+                          const matchingTab = tabs.find(t => t.bookingId === booking.id);
+                          if (matchingTab) {
+                            matchingTab.items.forEach(item => {
+                              events.push(`Tab consumazione: +${item.label} x${item.qty} (${item.price * item.qty}€)`);
+                            });
+                            if (matchingTab.paid) {
+                              events.push(`Tab saldato via ${matchingTab.paidMethod === "cash" ? "Contanti" : "Carta"}`);
+                            }
+                          }
+
+                          if (events.length === 0) {
+                            return <p className="text-slate-400 text-[10px] italic">Nessun movimento registrato.</p>;
+                          }
+
+                          return (
+                            <ul className="text-[10px] text-slate-600 space-y-1 bg-white p-2 rounded-lg border border-slate-100 list-disc pl-4 font-medium shadow-sm">
+                              {events.map((evt, eIdx) => (
+                                <li key={eIdx}>{evt}</li>
+                              ))}
+                            </ul>
+                          );
+                        })()}
+                      </div>
+
                       {/* Cancel Booking Action */}
                       <button
                         id={`btn-cancel-book-${booking.id}`}
                         onClick={() => handleCancelBooking(booking)}
-                        className="w-full py-1.5 border border-rose-200 hover:bg-rose-50 text-rose-600 text-xs font-semibold rounded-lg transition-colors mt-2"
+                        className="w-full py-1.5 border border-rose-200 hover:bg-rose-50 text-rose-600 text-xs font-semibold rounded-lg transition-colors mt-2 cursor-pointer"
                       >
                         Cancella Prenotazione
                       </button>

@@ -4,6 +4,8 @@ import multer from "multer";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
+// @ts-ignore
+import mammoth from "mammoth";
 
 // Firebase web imports for server-side API proxying
 import { initializeApp } from "firebase/app";
@@ -98,6 +100,39 @@ function getGemini(): GoogleGenAI {
     });
   }
   return aiInstance;
+}
+
+// Robust helper to perform Gemini generation with retry logic for transient/overloaded errors
+async function generateContentWithRetry(ai: GoogleGenAI, params: any, retries = 4, delay = 1500) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err: any) {
+      const status = err.status || err.statusCode;
+      const message = String(err.message || "").toUpperCase();
+      const isTransient = 
+        !status || 
+        status === 503 || 
+        status === 429 || 
+        status === 500 ||
+        status === 504 ||
+        message.includes("503") ||
+        message.includes("429") ||
+        message.includes("UNAVAILABLE") ||
+        message.includes("TEMPORARY") ||
+        message.includes("DEMAND") ||
+        message.includes("EXHAUSTED");
+
+      if (isTransient && i < retries - 1) {
+        const waitTime = delay * Math.pow(2, i);
+        console.warn(`Gemini API returned a transient error (${err.message || err}). Retrying in ${waitTime}ms... (Attempt ${i + 1}/${retries})`);
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("Failed after maximum retries");
 }
 
 // Health check endpoint
@@ -260,15 +295,8 @@ app.post("/api/parse-scanner", upload.array("files"), async (req, res) => {
 
     for (const file of files) {
       try {
-        const base64Data = file.buffer.toString("base64");
-        
-        // Prepare file part
-        const filePart = {
-          inlineData: {
-            mimeType: file.mimetype,
-            data: base64Data
-          }
-        };
+        const isDocx = file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || 
+                       file.originalname.toLowerCase().endsWith(".docx");
 
         const promptText = `
 Estrai tutte le prenotazioni o registrazioni del lido presenti in questo documento o immagine.
@@ -283,12 +311,32 @@ Se trovi righe che fanno riferimento a lettini multipli (es. 'Lettini 12 e 13'),
 Restituisci solo un array di oggetti validi secondo la risposta strutturata JSON richiesta.
         `;
 
-        const response = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: [
+        let contents: any[] = [];
+
+        if (isDocx) {
+          const mammothResult = await mammoth.extractRawText({ buffer: file.buffer });
+          const docxText = mammothResult.value;
+          contents = [
+            { text: `CONTENUTO DEL DOCUMENTO WORD:\n${docxText}` },
+            { text: promptText }
+          ];
+        } else {
+          const base64Data = file.buffer.toString("base64");
+          const filePart = {
+            inlineData: {
+              mimeType: file.mimetype,
+              data: base64Data
+            }
+          };
+          contents = [
             filePart,
             { text: promptText }
-          ],
+          ];
+        }
+
+        const response = await generateContentWithRetry(ai, {
+          model: "gemini-3.5-flash",
+          contents,
           config: {
             responseMimeType: "application/json",
             responseSchema: {

@@ -923,20 +923,36 @@ export default function DailyMapModule({
 
       {/* PRINTABLE MAP MODAL OVERLAY */}
       {isPrintModalOpen && (
-        <div id="print-modal-overlay" className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex flex-col p-4 md:p-8 overflow-y-auto print:p-0 print:m-0 print:absolute print:inset-0 print:bg-white">
+        <div id="print-modal-overlay" className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex flex-col p-4 md:p-8 overflow-y-auto print:static print:block print:p-0 print:m-0 print:bg-white print:overflow-visible print:h-auto print:w-full">
           <style dangerouslySetInnerHTML={{ __html: `
             @media print {
+              html, body, #root {
+                height: auto !important;
+                overflow: visible !important;
+                position: static !important;
+              }
               body * {
                 visibility: hidden !important;
               }
-              #print-preview-document, #print-preview-document * {
+              #print-modal-overlay, #print-preview-document, #print-preview-document * {
                 visibility: visible !important;
               }
-              #print-preview-document {
-                position: absolute !important;
-                left: 0 !important;
-                top: 0 !important;
+              #print-modal-overlay {
+                position: static !important;
+                display: block !important;
+                padding: 0 !important;
+                margin: 0 !important;
+                overflow: visible !important;
+                height: auto !important;
                 width: 100% !important;
+                background: white !important;
+              }
+              #print-preview-document {
+                position: static !important;
+                display: block !important;
+                width: 100% !important;
+                height: auto !important;
+                overflow: visible !important;
                 background: white !important;
                 color: black !important;
                 padding: 0 !important;

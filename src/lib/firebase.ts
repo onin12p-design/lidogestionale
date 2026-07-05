@@ -92,6 +92,7 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
 // Anti double-booking transactional helper function (P1)
 import { runTransaction } from "firebase/firestore";
 import { Booking } from "../types";
+import { sanitizeForFirestore } from "../utils";
 
 export interface TransactionResult {
   success: boolean;
@@ -175,7 +176,7 @@ export async function createBookingTransactional(booking: Omit<Booking, "id" | "
         createdAt: new Date().toISOString()
       };
 
-      transaction.set(targetRef, finalBooking);
+      transaction.set(targetRef, sanitizeForFirestore(finalBooking));
       return finalBooking;
     });
 

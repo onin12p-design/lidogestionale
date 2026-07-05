@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from "react";
 import { Subscription, Booking, Customer, Payment, BookingSlot, SubscriptionStatus, PaymentMethod, PaymentKind } from "../types";
 import { getFirestore, setDoc, doc, collection, addDoc, getDocs, query, where, writeBatch, serverTimestamp, deleteDoc, onSnapshot } from "firebase/firestore";
-import { db, handleFirestoreError, OperationType } from "../lib/firebase";
-import { getRomeTodayString, adjustDateString, formatItalianDate } from "../utils";
+import { db, handleFirestoreError, OperationType, createBookingTransactional } from "../lib/firebase";
+import { getRomeTodayString, adjustDateString, formatItalianDate, isValidBedNumber, sanitizeForFirestore } from "../utils";
 import { UserPlus, Calendar, Plus, Trash2, ShieldAlert, CreditCard, CheckCircle, Clock, AlertCircle, Save } from "lucide-react";
+import ConfirmationModal from "./ConfirmationModal";
 
 interface SubscriptionsModuleProps {
   subscriptions: Subscription[];
@@ -26,6 +27,9 @@ export default function SubscriptionsModule({
   const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [conflictsList, setConflictsList] = useState<{ date: string; bedNumber: number; slot: BookingSlot; customer: string }[]>([]);
+
+  const [confirmDeleteSubOpen, setConfirmDeleteSubOpen] = useState(false);
+  const [subToDelete, setSubToDelete] = useState<Subscription | null>(null);
 
   // Form states
   const [customerName, setCustomerName] = useState("");
@@ -131,7 +135,7 @@ export default function SubscriptionsModule({
     setSavingNotes(true);
     try {
       const subRef = doc(db, "subscriptions", selectedSub.id!);
-      await setDoc(subRef, { notes: subNotes }, { merge: true });
+      await setDoc(subRef, sanitizeForFirestore({ notes: subNotes }), { merge: true });
       
       // Update local state copy to avoid lagging feel
       setSelectedSub(prev => prev ? { ...prev, notes: subNotes } : null);
@@ -182,10 +186,10 @@ export default function SubscriptionsModule({
     const bedNums = bedNumbersInput
       .split(",")
       .map((s) => Number(s.trim()))
-      .filter((n) => !isNaN(n) && n > 0 && n <= 109);
+      .filter((n) => !isNaN(n) && isValidBedNumber(n));
 
     if (bedNums.length === 0) {
-      setErrorMessage("Inserisci almeno un numero di lettino valido (1-109).");
+      setErrorMessage("Inserisci almeno un numero di lettino valido dello stabilimento (es. 1-34, 60-109).");
       setSaving(false);
       return;
     }
@@ -242,18 +246,19 @@ export default function SubscriptionsModule({
       // 3. Setup Customer (A5)
       const custId = doc(collection(db, "customers")).id;
       const customerRef = doc(db, "customers", custId);
-      await setDoc(customerRef, {
+      const customerData = sanitizeForFirestore({
         name: customerName,
         phone: customerPhone,
         type: "subscriber",
         notes: customerNotes
       });
+      await setDoc(customerRef, customerData);
 
       // 4. Save Subscription (A5)
       const subId = doc(collection(db, "subscriptions")).id;
       const subscriptionRef = doc(db, "subscriptions", subId);
       
-      const subscriptionData: Subscription = {
+      const subscriptionData: Subscription = sanitizeForFirestore({
         id: subId,
         customerId: custId,
         customerName: customerName,
@@ -263,37 +268,66 @@ export default function SubscriptionsModule({
         slot,
         priceTotal,
         status: "active",
-        notes: customerNotes
-      };
-      if (selectedDays.length > 0) {
-        subscriptionData.daysOfWeek = selectedDays;
-      }
+        notes: customerNotes,
+        ...(selectedDays.length > 0 ? { daysOfWeek: selectedDays } : {})
+      });
 
       await setDoc(subscriptionRef, subscriptionData);
 
-      // 5. Generate Bookings in Batch
-      const batch = writeBatch(db);
-      dates.forEach(date => {
-        bedNums.forEach(bedNum => {
-          const bookingId = `${date}_${bedNum}_${slot}`;
-          const bookingRef = doc(db, "bookings", bookingId);
-          
-          batch.set(bookingRef, {
+      // 5. Generate Bookings with Transactional anti double-booking logic (P1)
+      const createdBookingIds: string[] = [];
+      let bookingFailed = false;
+      let failureReason = "";
+
+      for (const date of dates) {
+        if (bookingFailed) break;
+        for (const bedNum of bedNums) {
+          const bookingData = sanitizeForFirestore({
             bedNumber: bedNum,
             date,
             slot,
             customerId: custId,
             customerName,
-            customerType: "subscriber",
+            customerType: "subscriber" as const,
             subscriptionId: subId,
-            source: "subscription",
-            notes: `Abbonamento: ${customerNotes}`,
-            createdAt: serverTimestamp()
+            source: "subscription" as const,
+            notes: `Abbonamento: ${customerNotes}`
           });
-        });
-      });
 
-      await batch.commit();
+          const txResult = await createBookingTransactional(bookingData);
+
+          if (txResult.success && txResult.booking) {
+            createdBookingIds.push(txResult.booking.id);
+          } else {
+            bookingFailed = true;
+            failureReason = txResult.error || `Conflitto imprevisto sul lettino ${bedNum} in data ${date}`;
+            break;
+          }
+        }
+      }
+
+      // Rollback if any single booking fails (keeping DB clean & consistent)
+      if (bookingFailed) {
+        for (const idToDel of createdBookingIds) {
+          try {
+            await deleteDoc(doc(db, "bookings", idToDel));
+          } catch (e) {
+            console.error("Rollback of booking failed:", idToDel, e);
+          }
+        }
+        try {
+          await deleteDoc(subscriptionRef);
+        } catch (e) {
+          console.error("Rollback of subscription failed:", subId, e);
+        }
+        try {
+          await deleteDoc(customerRef);
+        } catch (e) {
+          console.error("Rollback of customer failed:", custId, e);
+        }
+
+        throw new Error(`Salvataggio interrotto per conflitto insorto durante la generazione: ${failureReason}`);
+      }
 
       // Reset form
       setCustomerName("");
@@ -314,22 +348,29 @@ export default function SubscriptionsModule({
     }
   };
 
-  const handleCancelSubscription = async (sub: Subscription) => {
-    if (!window.confirm(`Sicuro di voler cancellare l'abbonamento per ${sub.customerName}? Tutte le prenotazioni FUTURE saranno rimosse.`)) return;
+  // Cancel/Delete subscription trigger
+  const triggerCancelSubscription = (sub: Subscription) => {
+    setSubToDelete(sub);
+    setConfirmDeleteSubOpen(true);
+  };
 
+  const handleCancelSubscriptionConfirm = async () => {
+    if (!subToDelete) return;
+    setConfirmDeleteSubOpen(false);
     setSaving(true);
+    setErrorMessage(null);
     try {
       const today = getRomeTodayString();
 
       // 1. Mark subscription as cancelled
-      const subRef = doc(db, "subscriptions", sub.id!);
-      await setDoc(subRef, { ...sub, status: "cancelled" });
+      const subRef = doc(db, "subscriptions", subToDelete.id!);
+      await setDoc(subRef, sanitizeForFirestore({ ...subToDelete, status: "cancelled" }));
 
       // 2. Query and delete future bookings belonging to this subscription
       const bookingsRef = collection(db, "bookings");
       const q = query(
         bookingsRef,
-        where("subscriptionId", "==", sub.id),
+        where("subscriptionId", "==", subToDelete.id),
         where("date", ">", today)
       );
 
@@ -342,9 +383,10 @@ export default function SubscriptionsModule({
       await batch.commit();
       setSelectedSub(null);
       onRefresh();
+      setSubToDelete(null);
     } catch (err: any) {
       console.error(err);
-      setErrorMessage("Errore durante la cancellazione dell'abbonamento.");
+      setErrorMessage(err.message || "Errore durante la cancellazione dell'abbonamento.");
     } finally {
       setSaving(false);
     }
@@ -359,7 +401,7 @@ export default function SubscriptionsModule({
       const paymentId = `pay_${Date.now()}`;
       const paymentRef = doc(db, "payments", paymentId);
 
-      await setDoc(paymentRef, {
+      await setDoc(paymentRef, sanitizeForFirestore({
         customerId: selectedSub.customerId,
         subscriptionId: selectedSub.id,
         amount: payAmount,
@@ -367,7 +409,7 @@ export default function SubscriptionsModule({
         kind: payKind,
         date: serverTimestamp(),
         operator: "Staff"
-      });
+      }));
 
       setPayAmount(0);
       onRefresh();
@@ -633,6 +675,8 @@ export default function SubscriptionsModule({
                       id="sub-start-date"
                       type="date"
                       required
+                      min="2026-01-01"
+                      max="2026-12-31"
                       value={startDate}
                       onChange={(e) => setStartDate(e.target.value)}
                       className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"
@@ -644,6 +688,8 @@ export default function SubscriptionsModule({
                       id="sub-end-date"
                       type="date"
                       required
+                      min="2026-01-01"
+                      max="2026-12-31"
                       value={endDate}
                       onChange={(e) => setEndDate(e.target.value)}
                       className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"
@@ -902,7 +948,7 @@ export default function SubscriptionsModule({
             {selectedSub.status === "active" && (
               <button
                 id="btn-sub-cancel"
-                onClick={() => handleCancelSubscription(selectedSub)}
+                onClick={() => triggerCancelSubscription(selectedSub)}
                 className="w-full py-2 border border-rose-200 text-rose-600 hover:bg-rose-50 rounded-xl text-xs font-semibold transition-colors mt-4 flex items-center justify-center gap-1"
               >
                 <Trash2 className="w-3.5 h-3.5" />
@@ -918,6 +964,20 @@ export default function SubscriptionsModule({
           </div>
         )}
       </div>
+
+      <ConfirmationModal
+        isOpen={confirmDeleteSubOpen}
+        title="Annulla Abbonamento"
+        message={subToDelete ? `Sicuro di voler cancellare l'abbonamento per ${subToDelete.customerName}? Tutte le prenotazioni FUTURE saranno rimosse.` : ""}
+        confirmLabel="Annulla Abbonamento"
+        cancelLabel="Indietro"
+        isDestructive={true}
+        onConfirm={handleCancelSubscriptionConfirm}
+        onCancel={() => {
+          setConfirmDeleteSubOpen(false);
+          setSubToDelete(null);
+        }}
+      />
 
     </div>
   );

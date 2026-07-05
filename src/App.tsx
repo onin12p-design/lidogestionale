@@ -10,18 +10,20 @@ import DailyMapModule from "./components/DailyMapModule";
 import ScannerModule from "./components/ScannerModule";
 import SubscriptionsModule from "./components/SubscriptionsModule";
 import CashierModule from "./components/CashierModule";
+import PricingModule from "./components/PricingModule";
 import ClientView from "./components/ClientView"; // Vista Cliente pubblica (C)
 
 // Icons
-import { LayoutDashboard, QrCode, Users, Euro, Sparkles, Loader2, RefreshCw, Lock, LogOut, Globe } from "lucide-react";
+import { LayoutDashboard, QrCode, Users, Euro, Sparkles, Loader2, RefreshCw, Lock, LogOut, Globe, AlertTriangle, X } from "lucide-react";
 
-type ActiveTab = "map" | "scanner" | "subscriptions" | "cashier";
+type ActiveTab = "map" | "scanner" | "subscriptions" | "cashier" | "pricing";
 
 export default function App() {
   const [currentDate, setCurrentDate] = useState<string>("");
   const [activeTab, setActiveTab] = useState<ActiveTab>("map");
   const [isAuth, setIsAuth] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState(false);
 
   // Cross-linking subscriber state (B1/B2)
   const [preSelectedSubId, setPreSelectedSubId] = useState<string | null>(null);
@@ -42,6 +44,7 @@ export default function App() {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
+  const [pricingConfigs, setPricingConfigs] = useState<any[]>([]);
   const [loadingData, setLoadingData] = useState(true);
 
   // Popstate location change listener
@@ -72,11 +75,13 @@ export default function App() {
     signInAnonymously(auth)
       .then(() => {
         setIsAuth(true);
+        setAuthError(false);
         setAuthLoading(false);
       })
       .catch((error) => {
-        console.warn("Firebase auth error (continuing with unauthenticated session):", error);
-        setIsAuth(true);
+        console.error("Firebase anonymous auth failed:", error);
+        setIsAuth(false);
+        setAuthError(true);
         setAuthLoading(false);
       });
   }, []);
@@ -145,23 +150,45 @@ export default function App() {
       setLoadingData(false);
     });
 
+    // Pricing configurations
+    const pricingQuery = collection(db, "pricing");
+    const unsubscribePricing = onSnapshot(pricingQuery, (snapshot) => {
+      const list: any[] = [];
+      snapshot.forEach((doc) => {
+        list.push({ id: doc.id, ...doc.data() });
+      });
+      setPricingConfigs(list);
+    }, (err) => console.error("Pricing sync error:", err));
+
     return () => {
       unsubscribeBookings();
       unsubscribeTabs();
       unsubscribePayments();
       unsubscribeSubscriptions();
+      unsubscribePricing();
     };
   }, [isAuth, currentDate]);
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (password === "samarinda2026") {
-      setIsLoggedStaff(true);
-      localStorage.setItem("samarinda_logged_staff", "true");
-      setLoginError(null);
-      setPassword("");
-    } else {
-      setLoginError("Password errata. Riprova.");
+    setLoginError(null);
+    try {
+      const response = await fetch("/api/staff-login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password })
+      });
+      const data = await response.json();
+      if (data.success) {
+        setIsLoggedStaff(true);
+        localStorage.setItem("samarinda_logged_staff", "true");
+        setPassword("");
+      } else {
+        setLoginError("Password errata. Riprova.");
+      }
+    } catch (err) {
+      console.error("Login error:", err);
+      setLoginError("Errore di connessione con il server.");
     }
   };
 
@@ -181,6 +208,115 @@ export default function App() {
     );
   }
 
+  if (authError) {
+    return (
+      <div id="auth-error-screen" className="flex flex-col items-center justify-center min-h-screen bg-slate-50 text-slate-800 p-6 md:p-8">
+        <div className="w-full max-w-xl bg-white rounded-3xl border border-slate-200 shadow-xl overflow-hidden text-left">
+          {/* Header */}
+          <div className="bg-rose-50 border-b border-rose-100 p-6 flex items-start gap-4">
+            <div className="w-12 h-12 bg-rose-500 text-white rounded-2xl flex items-center justify-center shrink-0 shadow-md">
+              <Lock className="w-6 h-6" />
+            </div>
+            <div>
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-800 mb-2">
+                Errore d'Accesso (Configurazione Richiesta)
+              </span>
+              <h2 className="text-xl font-bold text-slate-800 leading-tight font-sans">Abilitare Accesso Anonimo</h2>
+              <p className="text-xs text-rose-600 font-semibold mt-1 font-mono">
+                Codice: auth/admin-restricted-operation
+              </p>
+            </div>
+          </div>
+
+          {/* Details & Explanation */}
+          <div className="p-6 md:p-8 space-y-5">
+            <p className="text-xs text-slate-600 leading-relaxed font-sans">
+              Per garantire la sicurezza e la conformità delle regole di accesso del database (<strong>default-deny</strong>), l'applicazione richiede un'autenticazione anonima per operare in sicurezza. Il provider "Anonimo" non è ancora attivo sul tuo progetto Firebase.
+            </p>
+
+            <div className="bg-blue-50/50 border border-blue-100 rounded-2xl p-4 text-xs text-slate-600 space-y-1 font-mono">
+              <div className="flex items-center gap-1.5 text-blue-800 font-bold mb-1 font-sans">
+                <Globe className="w-4 h-4 shrink-0 text-blue-600" />
+                <span>Identificativi Progetto</span>
+              </div>
+              <p>Progetto: <strong className="font-semibold text-slate-800">gen-lang-client-0413763692</strong></p>
+              <p>Database: <strong className="font-semibold text-slate-800">ai-studio-32ba66f9-fa10-4db6-8413-9c47def28b74</strong></p>
+            </div>
+
+            {/* Instruction Steps */}
+            <div className="space-y-3 font-sans">
+              <h3 className="text-xs font-black text-slate-800 uppercase tracking-wider">Istruzioni Passo-Passo per l'Abilitazione:</h3>
+              <div className="space-y-2.5">
+                <div className="flex items-start gap-3">
+                  <span className="w-5 h-5 bg-slate-100 text-slate-800 rounded-full flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">1</span>
+                  <div className="text-xs text-slate-600">
+                    Accedi alla <strong><a href="https://console.firebase.google.com/" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 underline inline-flex items-center gap-0.5 font-bold">Console Firebase <span className="text-[9px]">↗</span></a></strong>.
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <span className="w-5 h-5 bg-slate-100 text-slate-800 rounded-full flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">2</span>
+                  <div className="text-xs text-slate-600">
+                    Seleziona il progetto attivo <strong className="text-slate-800 font-semibold">gen-lang-client-0413763692</strong>.
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <span className="w-5 h-5 bg-slate-100 text-slate-800 rounded-full flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">3</span>
+                  <div className="text-xs text-slate-600">
+                    Dal menu di sinistra, fai clic su <strong className="text-slate-800">Build (Crea)</strong> → <strong className="text-slate-800">Authentication</strong>.
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <span className="w-5 h-5 bg-slate-100 text-slate-800 rounded-full flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">4</span>
+                  <div className="text-xs text-slate-600">
+                    Seleziona la scheda <strong className="text-slate-800">Sign-in method</strong> (Metodo d'accesso) in alto.
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <span className="w-5 h-5 bg-slate-100 text-slate-800 rounded-full flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">5</span>
+                  <div className="text-xs text-slate-600">
+                    Fai clic su <strong className="text-slate-800">Aggiungi nuovo provider</strong> (Add provider) e seleziona <strong className="text-slate-800">Anonimo</strong> (Anonymous).
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <span className="w-5 h-5 bg-slate-100 text-slate-800 rounded-full flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">6</span>
+                  <div className="text-xs text-slate-600">
+                    Attiva l'interruttore <strong>Abilita</strong> (Enable) e fai clic su <strong className="text-slate-800">Salva</strong>.
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3 font-sans">
+              <button
+                id="btn-retry-auth"
+                onClick={() => {
+                  setAuthError(false);
+                  setAuthLoading(true);
+                  signInAnonymously(auth)
+                    .then(() => {
+                      setIsAuth(true);
+                      setAuthError(false);
+                      setAuthLoading(false);
+                    })
+                    .catch((error) => {
+                      console.error("Firebase auth retry error:", error);
+                      setAuthError(true);
+                      setAuthLoading(false);
+                    });
+                }}
+                className="px-6 py-2.5 bg-[#025A70] hover:bg-[#014152] active:bg-[#01313d] text-white font-bold rounded-xl shadow-md transition-all flex items-center gap-1.5 cursor-pointer text-xs"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Ho abilitato l'accesso, Riprova</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // Public Client View (C)
   if (path !== "/gestione") {
     return <ClientView />;
@@ -190,9 +326,9 @@ export default function App() {
   if (!isLoggedStaff) {
     return (
       <div id="login-container" className="min-h-screen bg-slate-950 flex flex-col justify-center items-center p-4">
-        <div className="w-full max-w-md bg-white rounded-3xl border border-slate-100 p-8 shadow-2xl flex flex-col gap-6">
+        <div className="w-full max-w-md bg-white rounded-3xl border border-[#EFECE6] p-8 shadow-2xl flex flex-col gap-6">
           <div className="text-center">
-            <div className="w-12 h-12 bg-blue-100 text-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-4">
+            <div className="w-12 h-12 bg-[#EAF4F6] text-[#025A70] rounded-2xl flex items-center justify-center mx-auto mb-4">
               <Lock className="w-6 h-6" />
             </div>
             <h2 className="text-xl font-extrabold text-slate-800">Gestionale Samarinda</h2>
@@ -209,7 +345,7 @@ export default function App() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all text-center tracking-widest text-lg"
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-[#025A70] transition-all text-center tracking-widest text-lg"
               />
             </div>
 
@@ -222,7 +358,7 @@ export default function App() {
             <button
               id="btn-login-submit"
               type="submit"
-              className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl shadow-md shadow-blue-500/10 transition-colors cursor-pointer text-sm"
+              className="w-full py-3 bg-[#025A70] hover:bg-[#014152] text-white font-bold rounded-xl shadow-md shadow-[#025A70]/10 transition-colors cursor-pointer text-sm"
             >
               Accedi al Gestionale
             </button>
@@ -243,19 +379,19 @@ export default function App() {
 
   // Full Management Dashboard View (isLoggedStaff === true) (C)
   return (
-    <div id="app-viewport" className="min-h-screen bg-slate-50/50 flex flex-col font-sans select-none antialiased">
+    <div id="app-viewport" className="min-h-screen bg-[#FDFBF7] flex flex-col font-sans select-none antialiased">
       
       {/* 1. TOP NAV / HEADER */}
       <header id="app-header" className="bg-slate-900 text-white px-4 py-3 md:px-6 md:py-4 shadow-md sticky top-0 z-40">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
           
           <div className="flex items-center gap-2.5">
-            <div className="bg-blue-600 p-2 rounded-xl text-white shadow-lg shadow-blue-500/20">
+            <div className="bg-[#025A70] p-2 rounded-xl text-white shadow-lg shadow-[#025A70]/20">
               <Sparkles className="w-5 h-5" />
             </div>
             <div>
               <h1 className="text-sm md:text-base font-black tracking-tight uppercase">Samarinda Fine Beach</h1>
-              <span className="text-[10px] text-blue-300 font-mono block">Gestionale Lido v2 • Santa Maria di Leuca</span>
+              <span className="text-[10px] text-[#B3D5DC] font-mono block">Gestionale Lido v2 • Santa Maria di Leuca</span>
             </div>
           </div>
 
@@ -297,7 +433,7 @@ export default function App() {
 
             <div className="bg-slate-800 px-3 py-1.5 rounded-xl border border-slate-700/60 text-xs font-semibold flex items-center gap-1.5">
               <span className="text-slate-400">Data Attiva:</span>
-              <span className="text-blue-200">{currentDate}</span>
+              <span className="text-[#EAF4F6]">{currentDate}</span>
             </div>
           </div>
 
@@ -305,14 +441,15 @@ export default function App() {
       </header>
 
       {/* 2. SUB HEADER TAB MENU */}
-      <div id="app-tab-navigation" className="bg-white border-b border-slate-100 px-4 shadow-sm py-2 sticky top-14 md:top-16 z-30">
+      <div id="app-tab-navigation" className="bg-white border-b border-[#EFECE6] px-4 shadow-sm py-2 sticky top-14 md:top-16 z-30">
         <div className="max-w-7xl mx-auto flex items-center justify-between overflow-x-auto gap-4">
           <div className="flex gap-1 md:gap-2">
             {[
               { id: "map", label: "Mappa Giornaliera", icon: LayoutDashboard },
               { id: "scanner", label: "Scanner Fogli", icon: QrCode },
               { id: "subscriptions", label: "Sezione Abbonati", icon: Users },
-              { id: "cashier", label: "Cassa e Tab", icon: Euro }
+              { id: "cashier", label: "Cassa e Tab", icon: Euro },
+              { id: "pricing", label: "Listino Prezzi", icon: Sparkles }
             ].map((tab) => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
@@ -323,8 +460,8 @@ export default function App() {
                   onClick={() => setActiveTab(tab.id as ActiveTab)}
                   className={`flex items-center gap-1.5 px-3 py-2 text-xs md:text-sm font-semibold rounded-xl transition-all duration-150 ${
                     isActive
-                      ? "bg-blue-600 text-white shadow-md shadow-blue-500/10"
-                      : "text-slate-600 hover:text-slate-900 hover:bg-slate-50"
+                      ? "bg-[#025A70] text-white shadow-md shadow-[#025A70]/10"
+                      : "text-[#025A70] hover:text-[#014152] hover:bg-[#EAF4F6]"
                   }`}
                 >
                   <Icon className="w-4 h-4" />
@@ -337,7 +474,7 @@ export default function App() {
       </div>
 
       {/* 3. MAIN DASHBOARD CONTENT AREA */}
-      <main id="app-main-content" className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6">
+      <main id="app-main-content" className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 space-y-4">
         
         {/* Module Switching */}
         {activeTab === "map" && (
@@ -354,6 +491,7 @@ export default function App() {
               setPreSelectedSubId(id);
               setActiveTab("subscriptions");
             }}
+            pricingConfigs={pricingConfigs}
           />
         )}
 
@@ -382,8 +520,13 @@ export default function App() {
             bookings={bookings}
             tabs={tabs}
             payments={payments}
+            pricingConfigs={pricingConfigs}
             onRefresh={() => {}} // real-time sync, no-op (A5)
           />
+        )}
+
+        {activeTab === "pricing" && (
+          <PricingModule pricingConfigs={pricingConfigs} />
         )}
 
       </main>

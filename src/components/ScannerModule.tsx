@@ -1,8 +1,8 @@
 import React, { useState } from "react";
 import { Booking, Customer, BookingSlot, CustomerType } from "../types";
-import { getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp } from "firebase/firestore";
-import { db, handleFirestoreError, OperationType } from "../lib/firebase";
-import { isValidBedNumber } from "../utils";
+import { getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "firebase/firestore";
+import { db, handleFirestoreError, OperationType, createBookingTransactional } from "../lib/firebase";
+import { isValidBedNumber, sanitizeForFirestore } from "../utils";
 import { Upload, AlertTriangle, Check, Trash2, Plus, Sparkles, Loader2 } from "lucide-react";
 
 interface ScannerModuleProps {
@@ -28,6 +28,7 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
   const [extractedItems, setExtractedItems] = useState<ExtractedItem[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [importResult, setImportResult] = useState<{ successCount: number; failedCount: number; failures: Array<{ bed: number; slot: string; reason: string }> } | null>(null);
 
   // File selection change
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -150,64 +151,100 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
     setExtractedItems((prev) => [...prev, newItem]);
   };
 
-  // Final batch import to Firestore
+  // Final transactional import to Firestore
   const handleImportAll = async () => {
     setUploading(true);
     setErrorMessage(null);
     setSuccessMessage(null);
+    setImportResult(null);
+
+    let successCount = 0;
+    let failedCount = 0;
+    const failures: Array<{ bed: number; slot: string; reason: string }> = [];
 
     try {
-      const batch = writeBatch(db);
-      let count = 0;
+      const itemsToImport = extractedItems.filter(item => item.isValidBed && item.importAction !== "skip");
 
-      for (const item of extractedItems) {
-        if (!item.isValidBed) continue;
-        if (item.importAction === "skip") continue;
-
-        // 1. Create customer document if not exists or use as denormalized
-        // For simplicity and speed, we create bookings using the customerName directly.
-        // We can also create a Customer record for them if desired.
-        const custId = `cust_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-        const customerRef = doc(collection(db, "customers"), custId);
-        
-        // Add customer write to batch if it's a new daily booking
-        batch.set(customerRef, {
-          name: item.customerName,
-          type: item.customerType,
-          notes: item.notes || ""
-        });
-
-        // 2. Deterministic booking document ID: date_bedNumber_slot
-        const bookingId = `${currentDate}_${item.bedNumber}_${item.slot}`;
-        const bookingRef = doc(db, "bookings", bookingId);
-
-        const bookingData = {
-          bedNumber: item.bedNumber,
-          date: currentDate,
-          slot: item.slot,
-          customerId: custId,
-          customerName: item.customerName,
-          customerType: item.customerType,
-          source: "scanner" as const,
-          notes: item.notes || "",
-          createdAt: serverTimestamp()
-        };
-
-        batch.set(bookingRef, bookingData);
-        count++;
-      }
-
-      if (count === 0) {
+      if (itemsToImport.length === 0) {
         throw new Error("Nessun lettino valido selezionato per l'importazione.");
       }
 
-      await batch.commit();
-      setSuccessMessage(`Importazione completata con successo! Inserite ${count} prenotazioni.`);
-      setExtractedItems([]);
+      for (const item of itemsToImport) {
+        try {
+          // If the action is overwrite, we delete existing conflicting bookings first
+          if (item.importAction === "overwrite") {
+            const conflicts = existingBookings.filter((b) => {
+              if (b.bedNumber !== item.bedNumber) return false;
+              return b.slot === item.slot || b.slot === "full_day" || item.slot === "full_day";
+            });
+
+            for (const b of conflicts) {
+              await deleteDoc(doc(db, "bookings", b.id));
+            }
+          }
+
+          // 1. Create customer document
+          const custId = `cust_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+          const customerRef = doc(collection(db, "customers"), custId);
+          
+          await setDoc(customerRef, sanitizeForFirestore({
+            name: item.customerName,
+            type: item.customerType,
+            notes: item.notes || ""
+          }));
+
+          // 2. Create the booking document via transaction
+          const bookingData = sanitizeForFirestore({
+            bedNumber: item.bedNumber,
+            date: currentDate,
+            slot: item.slot,
+            customerId: custId,
+            customerName: item.customerName,
+            customerType: item.customerType,
+            source: "scanner" as const,
+            notes: item.notes || ""
+          });
+
+          const txResult = await createBookingTransactional(bookingData);
+
+          if (txResult.success) {
+            successCount++;
+          } else {
+            failedCount++;
+            failures.push({
+              bed: item.bedNumber,
+              slot: item.slot,
+              reason: txResult.error || "Doppia prenotazione rilevata tramite transazione."
+            });
+          }
+        } catch (err: any) {
+          failedCount++;
+          failures.push({
+            bed: item.bedNumber,
+            slot: item.slot,
+            reason: err.message || "Errore sconosciuto di scrittura"
+          });
+        }
+      }
+
+      setImportResult({
+        successCount,
+        failedCount,
+        failures
+      });
+
+      if (failedCount === 0) {
+        setSuccessMessage(`Importazione completata con successo! Inserite ${successCount} prenotazioni.`);
+        setExtractedItems([]);
+      } else if (successCount > 0) {
+        setSuccessMessage(`Importazione parziale completata. Inserite ${successCount} prenotazioni.`);
+      } else {
+        setErrorMessage("Nessuna prenotazione importata a causa di conflitti o errori.");
+      }
+
       onImportComplete();
     } catch (err: any) {
       console.error(err);
-      handleFirestoreError(err, OperationType.WRITE, "bookings_batch");
       setErrorMessage(err.message || "Errore durante il salvataggio delle prenotazioni.");
     } finally {
       setUploading(false);
@@ -260,6 +297,28 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
         <div id="scanner-success" className="flex items-center gap-2 p-4 bg-emerald-50 border border-emerald-100 rounded-xl mb-4 text-sm text-emerald-700">
           <Check className="w-5 h-5 text-emerald-500 shrink-0" />
           <div>{successMessage}</div>
+        </div>
+      )}
+
+      {importResult && (
+        <div id="scanner-summary" className="p-4 bg-slate-50 border border-slate-100 rounded-xl mb-4 text-xs space-y-2">
+          <div className="font-bold text-slate-700 uppercase tracking-wider text-[10px]">Esito Importazione:</div>
+          <div className="flex gap-4">
+            <span className="text-emerald-700 font-semibold">Importate con successo: {importResult.successCount}</span>
+            <span className="text-rose-700 font-semibold">Fallite: {importResult.failedCount}</span>
+          </div>
+          {importResult.failures.length > 0 && (
+            <div className="mt-2 space-y-1">
+              <div className="font-semibold text-rose-600">Dettaglio fallimenti:</div>
+              <ul className="list-disc pl-4 text-slate-600 space-y-0.5">
+                {importResult.failures.map((f, idx) => (
+                  <li key={idx}>
+                    Lettino {f.bed} ({f.slot === "full_day" ? "Giornata Intera" : f.slot === "morning" ? "Mattina" : "Pomeriggio"}): <span className="font-medium text-rose-600">{f.reason}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
 

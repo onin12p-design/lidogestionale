@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { Booking, Tab, Payment, PaymentMethod, PaymentKind, TabItem } from "../types";
 import { getFirestore, setDoc, doc, collection, addDoc, getDocs, writeBatch, serverTimestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../lib/firebase";
+import { sanitizeForFirestore, getPriceForBooking } from "../utils";
 import { Coffee, CreditCard, Euro, CheckCircle, Search, Clock, AlertTriangle, Plus, Trash } from "lucide-react";
 
 interface CashierModuleProps {
@@ -9,10 +10,11 @@ interface CashierModuleProps {
   bookings: Booking[];
   tabs: Tab[];
   payments: Payment[];
+  pricingConfigs?: any[];
   onRefresh: () => void;
 }
 
-export default function CashierModule({ currentDate, bookings, tabs, payments, onRefresh }: CashierModuleProps) {
+export default function CashierModule({ currentDate, bookings, tabs, payments, pricingConfigs = [], onRefresh }: CashierModuleProps) {
   const [saving, setSaving] = useState(false);
   
   // Tab quick adding items
@@ -32,7 +34,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, o
     const bPayments = payments.filter((p) => p.bookingId === booking.id);
     const paidSum = bPayments.reduce((sum, p) => sum + p.amount, 0);
 
-    let expectedPrice = booking.slot === "full_day" ? 30 : 15; // default rate
+    let expectedPrice = getPriceForBooking(booking.date, booking.bedNumber, booking.slot, pricingConfigs);
     const balance = expectedPrice - paidSum;
 
     let payStatus: "paid" | "partial" | "unpaid" = "unpaid";
@@ -149,7 +151,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, o
       const paymentId = `pay_${Date.now()}`;
       const paymentRef = doc(db, "payments", paymentId);
 
-      await setDoc(paymentRef, {
+      await setDoc(paymentRef, sanitizeForFirestore({
         customerId: selectedBookingForPay.customerId || "",
         bookingId: selectedBookingForPay.id,
         amount: payAmount,
@@ -157,7 +159,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, o
         kind: payKind,
         date: serverTimestamp(),
         operator: "Staff"
-      });
+      }));
 
       setSelectedBookingForPay(null);
       setPayAmount(0);
@@ -188,13 +190,13 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, o
         qty: tabQty
       });
 
-      await setDoc(tabRef, {
+      await setDoc(tabRef, sanitizeForFirestore({
         bookingId: selectedBookingForTab.id,
         bedNumber: selectedBookingForTab.bedNumber,
         date: currentDate,
         items: newItems,
         paid: false
-      });
+      }));
 
       setTabLabel("");
       setTabPrice(0);
@@ -217,24 +219,24 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, o
       const total = tab.items.reduce((sum, item) => sum + item.price * item.qty, 0);
 
       // 1. Mark Tab as paid
-      await setDoc(tabRef, {
+      await setDoc(tabRef, sanitizeForFirestore({
         ...tab,
         paid: true,
         paidMethod: method
-      });
+      }));
 
       // 2. Write a payment for this tab
       const paymentId = `pay_tab_${Date.now()}`;
       const paymentRef = doc(db, "payments", paymentId);
 
-      await setDoc(paymentRef, {
+      await setDoc(paymentRef, sanitizeForFirestore({
         bookingId: tab.bookingId,
         amount: total,
         method: method,
         kind: "full",
         date: serverTimestamp(),
         operator: "Staff"
-      });
+      }));
 
       setSelectedBookingForTab(null);
       onRefresh();
@@ -250,10 +252,10 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, o
       const tabRef = doc(db, "tabs", tab.bookingId);
       const updatedItems = tab.items.filter((_, idx) => idx !== index);
 
-      await setDoc(tabRef, {
+      await setDoc(tabRef, sanitizeForFirestore({
         ...tab,
         items: updatedItems
-      });
+      }));
 
       onRefresh();
     } catch (err) {

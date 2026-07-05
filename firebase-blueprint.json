@@ -195,9 +195,33 @@
         }
       },
       "required": ["bookingId", "bedNumber", "date", "items", "paid"]
+    },
+    "Pricing": {
+      "title": "Pricing",
+      "description": "Seasonal monthly pricing configuration by row",
+      "type": "object",
+      "properties": {
+        "monthId": {
+          "type": "string",
+          "description": "Month index, e.g. '05', '06', '07', '08', '09'"
+        },
+        "monthName": {
+          "type": "string",
+          "description": "Italian name of the month"
+        },
+        "prices": {
+          "type": "object",
+          "description": "Map of row numbers to RowPricing"
+        }
+      },
+      "required": ["monthId", "monthName", "prices"]
     }
   },
   "firestore": {
+    "/pricing/{monthId}": {
+      "schema": "Pricing",
+      "description": "Monthly row pricing"
+    },
     "/customers/{customerId}": {
       "schema": "Customer",
       "description": "Customers collection"

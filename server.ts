@@ -21,14 +21,30 @@ const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 const auth = getAuth(firebaseApp);
 
-// Authenticate server anonymously to read/write Firestore
-signInAnonymously(auth)
-  .then(() => {
-    console.log("Server authenticated with Firestore successfully.");
-  })
-  .catch((err) => {
-    console.warn("Server anonymous auth failed (continuing with unauthenticated session):", err);
-  });
+let isServerAuth = false;
+let serverAuthError: any = null;
+
+export async function ensureServerAuth() {
+  if (isServerAuth && auth.currentUser) {
+    return;
+  }
+  try {
+    const credential = await signInAnonymously(auth);
+    isServerAuth = true;
+    serverAuthError = null;
+    console.log("Server authenticated with Firestore successfully:", credential.user.uid);
+  } catch (err: any) {
+    isServerAuth = false;
+    serverAuthError = err;
+    console.warn("Server anonymous auth failed (proceeding in unauthenticated fallback mode):", err);
+    // Do not throw; proceed unauthenticated so that the server can still make queries if firestore.rules allows it or are not yet active.
+  }
+}
+
+// Initial server-side auth attempt
+ensureServerAuth().catch((err) => {
+  console.warn("Initial server anonymous auth failed. Will retry on request.");
+});
 
 // Setup JSON and URL-encoded body parsers
 app.use(express.json({ limit: "50mb" }));
@@ -87,6 +103,17 @@ function getGemini(): GoogleGenAI {
 // Health check endpoint
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// POST staff login endpoint checking environment variable
+app.post("/api/staff-login", (req, res) => {
+  const { password } = req.body;
+  const staffPassword = process.env.SECRET_STAFF_PASSWORD || "samarinda2026";
+  if (password === staffPassword) {
+    res.json({ success: true });
+  } else {
+    res.json({ success: false });
+  }
 });
 
 // GET available Gemini models
@@ -156,6 +183,17 @@ app.get("/api/availability", async (req, res) => {
     }
 
     // Fetch from Firestore
+    try {
+      await ensureServerAuth();
+    } catch (authErr: any) {
+      console.error("Authentication failure before Firestore fetch:", authErr);
+      res.status(500).json({
+        error: "Autenticazione non riuscita. Verificare la connessione o che il provider Anonimo sia abilitato nella console Firebase.",
+        details: authErr.message || String(authErr)
+      });
+      return;
+    }
+
     const bookingsQuery = query(collection(db, "bookings"), where("date", "==", date));
     const snapshot = await getDocs(bookingsQuery);
 

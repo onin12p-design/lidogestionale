@@ -10,7 +10,7 @@ interface ClientViewProps {
 
 export default function ClientView({ bedsConfig = {}, rowsConfig = {} }: ClientViewProps) {
   const [clientDate, setClientDate] = useState("");
-  const [availability, setAvailability] = useState<{ bedNumber: number; status: "free" | "morning_free" | "afternoon_free" | "full" }[]>([]);
+  const [availability, setAvailability] = useState<{ bedNumber: number; status: "free" | "morning_free" | "afternoon_free" | "partial" | "full" }[]>([]);
   const [totals, setTotals] = useState({ totalItems: 252, occupiedItems: 0, freeItems: 252 });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,8 +72,8 @@ export default function ClientView({ bedsConfig = {}, rowsConfig = {} }: ClientV
   // Statistics counts based on availability
   const totalBeds = availability.length || 84;
   const fullBedsCount = availability.filter((a) => a.status === "full").length;
-  const partialBedsCount = availability.filter((a) => a.status === "morning_free" || a.status === "afternoon_free").length;
-  const freeBedsCount = totalBeds - fullBedsCount; // Any bed that has some vacancy is counted as free or partly free
+  const partialBedsCount = availability.filter((a) => a.status === "morning_free" || a.status === "afternoon_free" || a.status === "partial").length;
+  const freeBedsCount = totalBeds - fullBedsCount - partialBedsCount; // Any bed that has some vacancy is counted as free or partly free
 
   return (
     <div id="client-view-root" className="min-h-screen bg-[#FDFBF7] flex flex-col font-sans select-none antialiased">
@@ -86,7 +86,7 @@ export default function ClientView({ bedsConfig = {}, rowsConfig = {} }: ClientV
               <Sun className="w-7 h-7 text-[#F2A104] animate-spin-slow" />
               Samarinda Fine Beach
             </h1>
-            <p className="text-xs text-[#B3D5DC] font-mono tracking-widest uppercase mt-1">Disponibilità Lettini • Santa Maria di Leuca</p>
+            <p className="text-xs text-[#B3D5DC] font-mono tracking-widest uppercase mt-1">Disponibilità Ombrelloni • Santa Maria di Leuca</p>
           </div>
           
           {/* Booking Contacts (C) */}
@@ -170,13 +170,13 @@ export default function ClientView({ bedsConfig = {}, rowsConfig = {} }: ClientV
 
             <div className="flex justify-between items-end mt-4">
               <div>
-                <span className="text-3xl font-black text-[#F2A104] font-mono">{totals.freeItems}</span>
-                <span className="text-xs text-slate-300 block font-semibold">Lettini Liberi</span>
+                <span className="text-3xl font-black text-[#F2A104] font-mono">{freeBedsCount}</span>
+                <span className="text-xs text-slate-300 block font-semibold">Ombrelloni Disponibili</span>
               </div>
               <div className="text-right text-[10px] text-slate-400 font-semibold space-y-0.5">
-                <div>Totale Lettini: <strong className="text-slate-200">{totals.totalItems}</strong></div>
-                <div>Occupati: <strong className="text-slate-200">{totals.occupiedItems}</strong></div>
-                <div>Postazioni Piene: <strong className="text-slate-200">{fullBedsCount}</strong></div>
+                <div>Totale Ombrelloni: <strong className="text-slate-200">{totalBeds}</strong></div>
+                <div>Parzialmente Occupati: <strong className="text-slate-200">{partialBedsCount}</strong></div>
+                <div>Completi: <strong className="text-slate-200">{fullBedsCount}</strong></div>
               </div>
             </div>
           </div>
@@ -196,6 +196,10 @@ export default function ClientView({ bedsConfig = {}, rowsConfig = {} }: ClientV
           <div className="flex items-center gap-1.5">
             <span className="w-3.5 h-3.5 bg-gradient-to-b from-[#EAF4F6] via-white to-slate-100 border border-[#B3D5DC] rounded"></span>
             <span className="font-semibold text-[#025A70]">Pomeriggio Libero (Mattina Occupata)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-3.5 h-3.5 border border-[#B3D5DC] rounded" style={{ background: "repeating-linear-gradient(45deg, rgba(243,239,230,0.9) 0 3px, #EAF4F6 3px 6px)" }}></span>
+            <span className="font-semibold text-[#025A70]">Parzialmente Occupato (Righe)</span>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="w-3.5 h-3.5 bg-[#F3EFE6]/80 border border-[#E5DFD3] rounded"></span>

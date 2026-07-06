@@ -30,6 +30,9 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
   const [payAmount, setPayAmount] = useState<number>(0);
   const [payMethod, setPayMethod] = useState<PaymentMethod>("cash");
   const [payKind, setPayKind] = useState<PaymentKind>("full");
+  const [payDiscount, setPayDiscount] = useState<number>(0);
+
+  const isSubscriptionBooking = (b: Booking) => b.source === "subscription" || b.customerType === "subscriber" || b.tipoPrenotazione === "abbonato" || !!b.subscriptionId;
 
   // Helper to compute payment statistics for a booking
   const getBookingFinance = (booking: Booking) => {
@@ -37,6 +40,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
     const paidSum = bPayments.reduce((sum, p) => sum + p.amount, 0);
 
     let expectedPrice = getBookingPriceProportional(booking, pricingConfigs, bedsConfig, rowsConfig);
+    expectedPrice = Math.max(0, expectedPrice - ((booking as any).sconto || 0));
     const balance = expectedPrice - paidSum;
 
     let payStatus: "paid" | "partial" | "unpaid" = "unpaid";
@@ -67,6 +71,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
     // Outstanding balances for today's bookings
     let pendingBeds = 0;
     bookings.forEach((b) => {
+      if (isSubscriptionBooking(b)) return;
       const { balance } = getBookingFinance(b);
       if (balance > 0) pendingBeds += balance;
     });
@@ -104,6 +109,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
 
     // Pending bookings (unpaid or acconto)
     bookings.forEach((b) => {
+      if (isSubscriptionBooking(b)) return;
       const { balance, payStatus } = getBookingFinance(b);
       if (balance > 0) {
         list.push({
@@ -160,14 +166,21 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
         method: payMethod,
         kind: payKind,
         date: serverTimestamp(),
-        operator: "Staff"
+        operator: "Staff",
+        dateStr: currentDate
       }));
+
+      if (payDiscount > 0) {
+        await setDoc(doc(db, "bookings", selectedBookingForPay.id), { sconto: payDiscount }, { merge: true });
+        setPayDiscount(0);
+      }
 
       setSelectedBookingForPay(null);
       setPayAmount(0);
       onRefresh();
     } catch (err) {
       console.error(err);
+    } finally {
       setSaving(false);
     }
   };
@@ -237,7 +250,8 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
         method: method,
         kind: "full",
         date: serverTimestamp(),
-        operator: "Staff"
+        operator: "Staff",
+        dateStr: currentDate
       }));
 
       setSelectedBookingForTab(null);
@@ -372,6 +386,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
                             onClick={() => {
                               setSelectedBookingForPay(item.booking);
                               setPayAmount(item.amount);
+                              setPayDiscount((item.booking as any).sconto || 0);
                             }}
                             className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[10px] font-bold uppercase px-2 py-1 rounded border border-emerald-200 transition-all"
                           >
@@ -442,6 +457,18 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
                   value={payAmount}
                   onChange={(e) => setPayAmount(Number(e.target.value))}
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Sconto (€) — opzionale</label>
+                <input
+                  id="pay-discount-quick"
+                  type="number"
+                  value={payDiscount}
+                  onChange={(e) => setPayDiscount(Number(e.target.value))}
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm"
+                  placeholder="0"
                 />
               </div>
 

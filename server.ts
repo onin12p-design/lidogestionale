@@ -307,7 +307,7 @@ app.get("/api/availability", async (req, res) => {
       const uniqueOccupiedItems = new Set<string>([...itemMorningOccupied, ...itemAfternoonOccupied]);
       occupiedItemsCount += uniqueOccupiedItems.size;
 
-      let status: "free" | "morning_free" | "afternoon_free" | "full" = "free";
+      let status: "free" | "morning_free" | "afternoon_free" | "partial" | "full" = "free";
 
       const totalSlots = totalItems * 2;
       const occupiedSlots = itemMorningOccupied.size + itemAfternoonOccupied.size;
@@ -317,13 +317,13 @@ app.get("/api/availability", async (req, res) => {
       } else if (occupiedSlots === totalSlots) {
         status = "full";
       } else {
-        // Partial slot occupancy categories
-        if (itemMorningOccupied.size > 0 && itemAfternoonOccupied.size === 0) {
+        // Partial slot occupancy categories (MODIFICA 7)
+        if (itemMorningOccupied.size >= totalItems && itemAfternoonOccupied.size === 0) {
           status = "afternoon_free";
-        } else if (itemAfternoonOccupied.size > 0 && itemMorningOccupied.size === 0) {
+        } else if (itemAfternoonOccupied.size >= totalItems && itemMorningOccupied.size === 0) {
           status = "morning_free";
         } else {
-          status = "morning_free"; // default partial label
+          status = "partial";
         }
       }
 

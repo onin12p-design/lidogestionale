@@ -120,20 +120,47 @@ export default function App() {
       setTabs(list);
     }, (err) => console.error("Tabs sync error:", err));
 
-    // Payments: load in realtime only those relevant for the active date (A3)
-    // Filter by bookingId starting with currentDate YYYY-MM-DD
-    const paymentsQuery = query(
+    // Payments: load in realtime with dual queries (main dateStr and legacy bookingId prefix) (MODIFICA 1)
+    let mainPaymentsList: Payment[] = [];
+    let legacyPaymentsList: Payment[] = [];
+
+    const updateCombinedPayments = () => {
+      const mergedMap = new Map<string, Payment>();
+      mainPaymentsList.forEach(p => {
+        if (p.id) mergedMap.set(p.id, p);
+      });
+      legacyPaymentsList.forEach(p => {
+        if (p.id) mergedMap.set(p.id, p);
+      });
+      setPayments(Array.from(mergedMap.values()));
+    };
+
+    const paymentsMainQuery = query(
       collection(db, "payments"),
-      where("bookingId", ">=", currentDate),
-      where("bookingId", "<=", currentDate + "\uf8ff")
+      where("dateStr", "==", currentDate)
     );
-    const unsubscribePayments = onSnapshot(paymentsQuery, (snapshot) => {
+    const unsubscribePaymentsMain = onSnapshot(paymentsMainQuery, (snapshot) => {
       const list: Payment[] = [];
       snapshot.forEach((doc) => {
         list.push({ id: doc.id, ...doc.data() } as Payment);
       });
-      setPayments(list);
-    }, (err) => console.error("Payments sync error:", err));
+      mainPaymentsList = list;
+      updateCombinedPayments();
+    }, (err) => console.error("Main payments sync error:", err));
+
+    const paymentsLegacyQuery = query(
+      collection(db, "payments"),
+      where("bookingId", ">=", currentDate),
+      where("bookingId", "<=", currentDate + "\uf8ff")
+    );
+    const unsubscribePaymentsLegacy = onSnapshot(paymentsLegacyQuery, (snapshot) => {
+      const list: Payment[] = [];
+      snapshot.forEach((doc) => {
+        list.push({ id: doc.id, ...doc.data() } as Payment);
+      });
+      legacyPaymentsList = list;
+      updateCombinedPayments();
+    }, (err) => console.error("Legacy payments sync error:", err));
 
     // Subscriptions: filter status == 'active' for the main view (A3)
     const subscriptionsQuery = query(
@@ -204,7 +231,8 @@ export default function App() {
     return () => {
       unsubscribeBookings();
       unsubscribeTabs();
-      unsubscribePayments();
+      unsubscribePaymentsMain();
+      unsubscribePaymentsLegacy();
       unsubscribeSubscriptions();
       unsubscribePricing();
       unsubscribeBeds();

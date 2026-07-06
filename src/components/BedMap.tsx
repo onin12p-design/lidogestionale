@@ -43,7 +43,7 @@ interface BedMapProps {
   selectedBed?: number | null;
   isClientView?: boolean;
   isExpanded?: boolean;
-  availability?: { bedNumber: number; status: "free" | "morning_free" | "afternoon_free" | "full" }[];
+  availability?: { bedNumber: number; status: "free" | "morning_free" | "afternoon_free" | "partial" | "full" }[];
   pricingConfigs?: any[];
   bedsConfig?: Record<number, number>;
   rowsConfig?: Record<number, number>;
@@ -85,6 +85,10 @@ export default function BedMap({
       } else if (status === "afternoon_free") {
         style = {
           background: `linear-gradient(180deg, rgba(243, 239, 230, 0.8) 50%, #EAF4F6 50%)`
+        };
+      } else if (status === "partial") {
+        style = {
+          background: "repeating-linear-gradient(45deg, rgba(243,239,230,0.9) 0 5px, #EAF4F6 5px 10px)"
         };
       } else {
         style = { backgroundColor: "#EAF4F6" };
@@ -205,6 +209,13 @@ export default function BedMap({
     } else {
       style = { backgroundColor: BOOKING_TYPE_COLORS.free };
       stateLabel = "free";
+    }
+
+    if (occupiedCount > 0 && occupiedCount < totalItems) {
+      const baseBg = style.background || style.backgroundColor || BOOKING_TYPE_COLORS.free;
+      style = {
+        background: `repeating-linear-gradient(45deg, rgba(255,255,255,0.5) 0 4px, transparent 4px 9px), ${baseBg}`
+      };
     }
 
     return {

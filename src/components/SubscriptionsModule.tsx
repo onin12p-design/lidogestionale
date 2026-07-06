@@ -286,6 +286,7 @@ export default function SubscriptionsModule({
             bedNumber: bedNum,
             date,
             slot,
+            tipoPrenotazione: "abbonato" as const,
             customerId: custId,
             customerName,
             customerType: "subscriber" as const,
@@ -408,7 +409,8 @@ export default function SubscriptionsModule({
         method: payMethod,
         kind: payKind,
         date: serverTimestamp(),
-        operator: "Staff"
+        operator: "Staff",
+        dateStr: getRomeTodayString()
       }));
 
       setPayAmount(0);

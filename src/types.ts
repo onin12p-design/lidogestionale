@@ -55,6 +55,7 @@ export interface Booking {
   subscriptionId?: string;
   source: BookingSource;
   notes?: string;
+  sconto?: number;
   createdAt: any; // Timestamp or ISO string
 }
 
@@ -68,6 +69,7 @@ export interface Payment {
   kind: PaymentKind;
   date: any; // timestamp
   operator?: string;
+  dateStr?: string;
 }
 
 export interface TabItem {

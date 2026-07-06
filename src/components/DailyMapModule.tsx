@@ -330,7 +330,8 @@ export default function DailyMapModule({
         method: payMethod,
         kind: payKind,
         date: serverTimestamp(),
-        operator: "Staff"
+        operator: "Staff",
+        dateStr: currentDate
       }));
 
       setPayAmount(0);

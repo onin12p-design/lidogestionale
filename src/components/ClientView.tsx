@@ -3,9 +3,15 @@ import { getRomeTodayString, adjustDateString, formatItalianDate } from "../util
 import BedMap from "./BedMap";
 import { Phone, MessageCircle, Calendar, RefreshCw, Sun, Clock, HelpCircle } from "lucide-react";
 
-export default function ClientView() {
+interface ClientViewProps {
+  bedsConfig?: Record<number, number>;
+  rowsConfig?: Record<number, number>;
+}
+
+export default function ClientView({ bedsConfig = {}, rowsConfig = {} }: ClientViewProps) {
   const [clientDate, setClientDate] = useState("");
   const [availability, setAvailability] = useState<{ bedNumber: number; status: "free" | "morning_free" | "afternoon_free" | "full" }[]>([]);
+  const [totals, setTotals] = useState({ totalItems: 252, occupiedItems: 0, freeItems: 252 });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -37,8 +43,20 @@ export default function ClientView() {
         return res.json();
       })
       .then((data) => {
-        if (Array.isArray(data)) {
+        if (data && data.availability) {
+          setAvailability(data.availability);
+          setTotals({
+            totalItems: data.totalItemsCount || 252,
+            occupiedItems: data.occupiedItemsCount || 0,
+            freeItems: data.freeItemsCount || 252
+          });
+        } else if (Array.isArray(data)) {
           setAvailability(data);
+          setTotals({
+            totalItems: data.length * 3,
+            occupiedItems: data.filter((a: any) => a.status === "full").length * 3,
+            freeItems: (data.length - data.filter((a: any) => a.status === "full").length) * 3
+          });
         } else {
           setAvailability([]);
         }
@@ -152,13 +170,13 @@ export default function ClientView() {
 
             <div className="flex justify-between items-end mt-4">
               <div>
-                <span className="text-3xl font-black text-[#F2A104] font-mono">{freeBedsCount}</span>
+                <span className="text-3xl font-black text-[#F2A104] font-mono">{totals.freeItems}</span>
                 <span className="text-xs text-slate-300 block font-semibold">Lettini Liberi</span>
               </div>
               <div className="text-right text-[10px] text-slate-400 font-semibold space-y-0.5">
-                <div>Totale Stabilimento: <strong className="text-slate-200">84</strong></div>
-                <div>Occupati Intero: <strong className="text-slate-200">{fullBedsCount}</strong></div>
-                <div>Fasce Parziali: <strong className="text-slate-200">{partialBedsCount}</strong></div>
+                <div>Totale Lettini: <strong className="text-slate-200">{totals.totalItems}</strong></div>
+                <div>Occupati: <strong className="text-slate-200">{totals.occupiedItems}</strong></div>
+                <div>Postazioni Piene: <strong className="text-slate-200">{fullBedsCount}</strong></div>
               </div>
             </div>
           </div>
@@ -202,7 +220,7 @@ export default function ClientView() {
 
           <div className="overflow-x-auto pb-4">
             <div className="min-w-[800px] flex justify-center">
-              <BedMap isClientView={true} availability={availability} />
+              <BedMap isClientView={true} availability={availability} bedsConfig={bedsConfig} rowsConfig={rowsConfig} />
             </div>
           </div>
         </div>

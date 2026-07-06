@@ -1,8 +1,8 @@
 import React, { useState } from "react";
-import { Booking, Tab, Payment, BookingSlot, CustomerType, PaymentMethod, PaymentKind } from "../types";
+import { Booking, Tab, Payment, BookingSlot, CustomerType, PaymentMethod, PaymentKind, BookingTipoPrenotazione } from "../types";
 import { getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType, createBookingTransactional } from "../lib/firebase";
-import { getRomeTodayString, adjustDateString, formatItalianDate, isValidBedNumber, sanitizeForFirestore, getPriceForBooking } from "../utils";
+import { getRomeTodayString, adjustDateString, formatItalianDate, isValidBedNumber, sanitizeForFirestore, getPriceForBooking, getBookingPriceProportional, getBedLettiniCount, getBedItems, hasConflict } from "../utils";
 import BedMap, { PEDANA_SINISTRA_LEFT, PEDANA_SINISTRA_RIGHT, PEDANA_DESTRA_LEFT, PEDANA_DESTRA_RIGHT } from "./BedMap";
 import { Calendar, ChevronLeft, ChevronRight, Search, Plus, Trash2, CreditCard, Coffee, Check, AlertCircle, Info, Users, Save, Clock, Printer, X, Maximize2, Minimize2, ExternalLink } from "lucide-react";
 import ConfirmationModal from "./ConfirmationModal";
@@ -18,6 +18,8 @@ interface DailyMapModuleProps {
   setSelectedBed: (bed: number | null) => void;
   onOpenSubscriberCard?: (subId: string) => void;
   pricingConfigs?: any[];
+  bedsConfig?: Record<number, number>;
+  rowsConfig?: Record<number, number>;
 }
 
 export default function DailyMapModule({
@@ -30,7 +32,9 @@ export default function DailyMapModule({
   selectedBed,
   setSelectedBed,
   onOpenSubscriberCard,
-  pricingConfigs = []
+  pricingConfigs = [],
+  bedsConfig = {},
+  rowsConfig = {}
 }: DailyMapModuleProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
@@ -46,6 +50,9 @@ export default function DailyMapModule({
   const [custName, setCustName] = useState("");
   const [custType, setCustType] = useState<CustomerType>("daily");
   const [bookSlot, setBookSlot] = useState<BookingSlot>("full_day");
+  const [tipoPrenotazione, setTipoPrenotazione] = useState<BookingTipoPrenotazione>("intera");
+  const [selectedRisorse, setSelectedRisorse] = useState<string[]>([]);
+  const [cartRisorse, setCartRisorse] = useState<{ postazione: number, items: string[] }[]>([]);
   const [bookNotes, setBookNotes] = useState("");
   const [bookPrice, setBookPrice] = useState<number>(30); // estimated price
 
@@ -92,29 +99,100 @@ export default function DailyMapModule({
 
   const selectedBedTab = getSelectedBedTab();
 
-  // Check which slots are still free for the selected bed
+  // Check which slots are still free for the selected bed (at least one item is free for that slot)
   const getFreeSlotsForSelectedBed = () => {
-    const activeSlots = selectedBedBookings.map((b) => b.slot);
-    if (activeSlots.includes("full_day")) return [];
-    
+    if (selectedBed === null) return [];
+    const numLettini = getBedLettiniCount(selectedBed, bedsConfig);
+    const allItems = getBedItems(selectedBed, numLettini);
+
     const free: BookingSlot[] = [];
-    if (!activeSlots.includes("morning")) free.push("morning");
-    if (!activeSlots.includes("afternoon")) free.push("afternoon");
-    
-    // Only allow full_day if no slots are occupied
-    if (activeSlots.length === 0) free.push("full_day");
+    const slotsToTest: BookingSlot[] = ["morning", "afternoon", "full_day"];
+
+    slotsToTest.forEach((slot) => {
+      // Is there at least one item on this bed that does not have a conflict with this slot?
+      const anyItemFree = allItems.some((item) => {
+        const itemBookings: any[] = [];
+        selectedBedBookings.forEach((b) => {
+          let occupiedItems: string[] = [];
+          if (b.risorse && b.risorse.length > 0) {
+            const res = b.risorse.find((r) => r.postazione === selectedBed);
+            if (res) occupiedItems = res.items;
+          } else {
+            const numL = getBedLettiniCount(selectedBed, bedsConfig);
+            occupiedItems = getBedItems(selectedBed, numL);
+          }
+          if (occupiedItems.includes(item)) {
+            itemBookings.push(b);
+          }
+        });
+
+        return !hasConflict(itemBookings, slot);
+      });
+
+      if (anyItemFree) {
+        free.push(slot);
+      }
+    });
+
     return free;
   };
 
   const freeSlots = getFreeSlotsForSelectedBed();
 
-  // Auto set slot when selectedBed changes or slots computed, and sync active notes
+  // Helper to calculate which resources are already occupied for a slot
+  const getOccupiedResourcesForSlot = (slot: BookingSlot) => {
+    const occupied = new Set<string>();
+    if (selectedBed === null) return occupied;
+
+    selectedBedBookings.forEach((b) => {
+      // Overlap checks: AM overlaps with Full Day or AM; PM overlaps with Full Day or PM; Full Day overlaps with any
+      const overlap = 
+        slot === "full_day" || 
+        b.slot === "full_day" || 
+        b.slot === slot;
+      
+      if (overlap) {
+        let items: string[] = [];
+        if (b.risorse && b.risorse.length > 0) {
+          const res = b.risorse.find((r) => r.postazione === selectedBed);
+          if (res) items = res.items;
+        } else {
+          // Default legacy occupies all items of the bed
+          const numLettini = getBedLettiniCount(selectedBed, bedsConfig);
+          items = getBedItems(selectedBed, numLettini);
+        }
+        items.forEach(item => occupied.add(item));
+      }
+    });
+    return occupied;
+  };
+
+  // Synchronize slot, default tipoPrenotazione, and selected/available sub-resources
   React.useEffect(() => {
-    if (freeSlots.length > 0) {
-      setBookSlot(freeSlots[0]);
-      setBookPrice(selectedBed !== null ? getPriceForBooking(currentDate, selectedBed, freeSlots[0], pricingConfigs) : (freeSlots[0] === "full_day" ? 30 : 15));
+    if (selectedBed !== null) {
+      // 1. Resolve slot
+      let activeSlot = bookSlot;
+      if (!freeSlots.includes(bookSlot) && freeSlots.length > 0) {
+        activeSlot = freeSlots[0];
+        setBookSlot(freeSlots[0]);
+      }
+
+      // 2. Resolve default tipoPrenotazione matching the slot
+      let defaultTipo: BookingTipoPrenotazione = "intera";
+      if (activeSlot === "morning") defaultTipo = "mattina";
+      else if (activeSlot === "afternoon") defaultTipo = "pomeriggio";
+      setTipoPrenotazione(defaultTipo);
+
+      // 3. Resolve available and default selected sub-resources
+      const numLettini = getBedLettiniCount(selectedBed, bedsConfig);
+      const allItems = getBedItems(selectedBed, numLettini);
+      const occupied = getOccupiedResourcesForSlot(activeSlot);
+      const available = allItems.filter(item => !occupied.has(item));
+      setSelectedRisorse(available);
+    } else {
+      setSelectedRisorse([]);
     }
-    
+
     // Synchronize interactive notes
     const notesMap: Record<string, string> = {};
     selectedBedBookings.forEach((b) => {
@@ -122,6 +200,43 @@ export default function DailyMapModule({
     });
     setActiveNotes(notesMap);
   }, [selectedBed, bookings]);
+
+  // Adjust default tipoPrenotazione and selected resources when bookSlot itself changes
+  React.useEffect(() => {
+    if (selectedBed !== null) {
+      let defaultTipo: BookingTipoPrenotazione = "intera";
+      if (bookSlot === "morning") defaultTipo = "mattina";
+      else if (bookSlot === "afternoon") defaultTipo = "pomeriggio";
+      setTipoPrenotazione(defaultTipo);
+
+      const numLettini = getBedLettiniCount(selectedBed, bedsConfig);
+      const allItems = getBedItems(selectedBed, numLettini);
+      const occupied = getOccupiedResourcesForSlot(bookSlot);
+      const available = allItems.filter(item => !occupied.has(item));
+      setSelectedRisorse(available);
+    }
+  }, [bookSlot]);
+
+  // Calculate final proportional price of the form
+  React.useEffect(() => {
+    if (cartRisorse.length > 0) {
+      const mockBooking = {
+        date: currentDate,
+        slot: bookSlot,
+        risorse: cartRisorse
+      };
+      const totalPrice = getBookingPriceProportional(mockBooking, pricingConfigs, bedsConfig, rowsConfig);
+      setBookPrice(totalPrice);
+    } else if (selectedBed !== null) {
+      const mockBooking = {
+        date: currentDate,
+        slot: bookSlot,
+        risorse: [{ postazione: selectedBed, items: selectedRisorse }]
+      };
+      const totalPrice = getBookingPriceProportional(mockBooking, pricingConfigs, bedsConfig, rowsConfig);
+      setBookPrice(totalPrice);
+    }
+  }, [selectedBed, bookSlot, selectedRisorse, cartRisorse, currentDate, pricingConfigs, bedsConfig, rowsConfig]);
 
   // Navigate dates
   const handlePrevDay = () => {
@@ -142,7 +257,16 @@ export default function DailyMapModule({
   // Perform quick booking (A1, A5)
   const handleQuickBook = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (selectedBed === null || !custName.trim()) return;
+    if (!custName.trim()) return;
+
+    const finalRisorse = cartRisorse.length > 0
+      ? cartRisorse
+      : selectedBed !== null ? [{ postazione: selectedBed, items: selectedRisorse }] : [];
+
+    if (finalRisorse.length === 0 || finalRisorse.every(r => r.items.length === 0)) {
+      setErrorMessage("Errore: devi selezionare almeno una risorsa (es. l'ombrellone o un lettino).");
+      return;
+    }
 
     setSaving(true);
     setErrorMessage(null);
@@ -158,10 +282,13 @@ export default function DailyMapModule({
       }));
 
       // Use the transactional helper for double-booking protection (A1)
+      const primaryBed = finalRisorse[0].postazione;
       const result = await createBookingTransactional({
-        bedNumber: selectedBed,
+        bedNumber: primaryBed,
         date: currentDate,
         slot: bookSlot,
+        tipoPrenotazione,
+        risorse: finalRisorse,
         customerId: custId,
         customerName: custName,
         customerType: custType,
@@ -177,6 +304,7 @@ export default function DailyMapModule({
       // Reset form
       setCustName("");
       setBookNotes("");
+      setCartRisorse([]);
       onRefresh();
     } catch (err: any) {
       console.error(err);
@@ -360,7 +488,7 @@ export default function DailyMapModule({
       subPrice = 30; // assume a fallback, but let's compute based on actual subscription model
     }
 
-    const expectedPrice = getPriceForBooking(booking.date, booking.bedNumber, booking.slot, pricingConfigs);
+    const expectedPrice = getBookingPriceProportional(booking, pricingConfigs, bedsConfig);
     const balance = expectedPrice - paidSum;
 
     let payStatus: "paid" | "partial" | "unpaid" = "unpaid";
@@ -501,6 +629,8 @@ export default function DailyMapModule({
             onBedSelect={(num) => setSelectedBed(num)}
             isExpanded={isExpanded}
             pricingConfigs={pricingConfigs}
+            bedsConfig={bedsConfig}
+            rowsConfig={rowsConfig}
           />
         </div>
       </div>
@@ -839,11 +969,7 @@ export default function DailyMapModule({
                       <select
                         id="book-slot"
                         value={bookSlot}
-                        onChange={(e) => {
-                          const s = e.target.value as BookingSlot;
-                          setBookSlot(s);
-                          setBookPrice(selectedBed !== null ? getPriceForBooking(currentDate, selectedBed, s, pricingConfigs) : (s === "full_day" ? 30 : 15));
-                        }}
+                        onChange={(e) => setBookSlot(e.target.value as BookingSlot)}
                         className="w-full px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-[#025A70] border-[#025A70]/20 bg-emerald-50/30"
                       >
                         {freeSlots.map((s) => (
@@ -853,6 +979,134 @@ export default function DailyMapModule({
                         ))}
                       </select>
                     </div>
+                  </div>
+
+                  {/* CR-1: Tipo Prenotazione Select */}
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">Tipo Prenotazione</label>
+                    <select
+                      id="book-tipo-prenotazione"
+                      value={tipoPrenotazione}
+                      onChange={(e) => setTipoPrenotazione(e.target.value as BookingTipoPrenotazione)}
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold"
+                    >
+                      <option value="intera">Giornata Intera</option>
+                      <option value="mattina">Mattina</option>
+                      <option value="pomeriggio">Pomeriggio</option>
+                      <option value="abbonato">Abbonato</option>
+                    </select>
+                  </div>
+
+                  {/* CR-2: Risorse Selezionabili */}
+                  <div className="bg-slate-50/50 p-3.5 rounded-xl border border-slate-200/60 space-y-2">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Risorse Postazione {selectedBed}</span>
+                    {selectedBed !== null && (() => {
+                      const numLettini = getBedLettiniCount(selectedBed, bedsConfig);
+                      const allItems = getBedItems(selectedBed, numLettini);
+                      const occupied = getOccupiedResourcesForSlot(bookSlot);
+
+                      return (
+                        <div className="space-y-1.5">
+                          {allItems.map((item) => {
+                            const isOccupiedByOther = occupied.has(item);
+                            const isSelected = selectedRisorse.includes(item);
+                            const label = item === "ombrellone" ? "Ombrellone" : `Lettino ${item.split("_")[1]}`;
+                            
+                            return (
+                              <label key={item} className={`flex items-center gap-2 text-xs font-medium ${isOccupiedByOther ? "text-slate-400 line-through" : "text-slate-700 cursor-pointer"}`}>
+                                <input
+                                  type="checkbox"
+                                  disabled={isOccupiedByOther}
+                                  checked={isSelected && !isOccupiedByOther}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setSelectedRisorse([...selectedRisorse, item]);
+                                    } else {
+                                      setSelectedRisorse(selectedRisorse.filter(x => x !== item));
+                                    }
+                                  }}
+                                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5"
+                                />
+                                <span>
+                                  {label} {isOccupiedByOther && <span className="text-[10px] text-rose-500 font-bold ml-1">(Occupato)</span>}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
+
+                    {selectedBed !== null && selectedRisorse.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const existingIdx = cartRisorse.findIndex(cr => cr.postazione === selectedBed);
+                          if (existingIdx > -1) {
+                            const updated = [...cartRisorse];
+                            updated[existingIdx] = { postazione: selectedBed, items: selectedRisorse };
+                            setCartRisorse(updated);
+                          } else {
+                            setCartRisorse([...cartRisorse, { postazione: selectedBed, items: selectedRisorse }]);
+                          }
+                        }}
+                        className="w-full mt-2 py-1.5 px-2 bg-slate-800 hover:bg-slate-900 text-white text-[10px] font-extrabold uppercase rounded-lg tracking-wider transition-colors cursor-pointer text-center"
+                      >
+                        Aggiungi a Prenotazione Multi-Postazione
+                      </button>
+                    )}
+                  </div>
+
+                  {/* CR-2: Cart View */}
+                  {cartRisorse.length > 0 && (
+                    <div className="bg-slate-950 text-slate-100 p-3 rounded-xl border border-slate-800 space-y-2">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Carrello Multi-Postazione</span>
+                        <button
+                          type="button"
+                          onClick={() => setCartRisorse([])}
+                          className="text-rose-400 hover:text-rose-300 text-[10px] font-bold uppercase"
+                        >
+                          Svuota
+                        </button>
+                      </div>
+                      <div className="space-y-1 max-h-32 overflow-y-auto">
+                        {cartRisorse.map((cr, idx) => (
+                          <div key={idx} className="flex justify-between items-center text-[11px] bg-slate-900/50 p-2 rounded-lg border border-slate-800">
+                            <div>
+                              <strong className="text-[#F2A104]">Lettino {cr.postazione}:</strong>{" "}
+                              <span className="text-slate-300">
+                                {cr.items.map(it => it === "ombrellone" ? "Omb." : `Let. ${it.split("_")[1]}`).join(", ")}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCartRisorse(cartRisorse.filter((_, i) => i !== idx));
+                              }}
+                              className="text-slate-400 hover:text-rose-400 font-bold ml-2 text-sm"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Price calculations display */}
+                  <div className="flex justify-between items-center bg-blue-50/40 px-3.5 py-2.5 rounded-xl border border-blue-100/30">
+                    <span className="text-xs font-semibold text-blue-800">Prezzo Calcolato:</span>
+                    <span className="text-sm font-black text-blue-900">
+                      {bookPrice} €
+                      <span className="text-[10px] font-normal text-blue-700 ml-1.5">
+                        {cartRisorse.length > 0 ? (
+                          `(${cartRisorse.reduce((acc, cr) => acc + cr.items.length, 0)} risorse multi-bed)`
+                        ) : (
+                          `(${selectedRisorse.length} di ${selectedBed !== null ? getBedLettiniCount(selectedBed, bedsConfig) + 1 : 3} risorse)`
+                        )}
+                      </span>
+                    </span>
                   </div>
 
                   <div>
@@ -1213,7 +1467,7 @@ export default function DailyMapModule({
                         const isSubscriber = b.customerType === "subscriber";
                         const bPayments = payments.filter((p) => p.bookingId === b.id);
                         const totalPaid = bPayments.reduce((sum, p) => sum + p.amount, 0);
-                        const expected = getPriceForBooking(b.date, b.bedNumber, b.slot, pricingConfigs);
+                        const expected = getBookingPriceProportional(b, pricingConfigs, bedsConfig, rowsConfig);
                         const remaining = Math.max(0, expected - totalPaid);
                         
                         const paymentDetails = isSubscriber 

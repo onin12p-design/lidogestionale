@@ -27,11 +27,28 @@ export interface Subscription {
   notes?: string;
 }
 
+export type BookingTipoPrenotazione = "mattina" | "pomeriggio" | "intera" | "abbonato";
+
+export const BOOKING_TYPE_COLORS = {
+  free: "#E5E7EB",       // grigio chiaro
+  mattina: "#FACC15",    // giallo
+  pomeriggio: "#FB923C", // arancio
+  intera: "#22C55E",     // verde
+  abbonato: "#8B5CF6",   // viola
+};
+
+export interface RisorsaOccupata {
+  postazione: number;
+  items: string[]; // e.g. ["ombrellone", "lettino_1", "lettino_2"]
+}
+
 export interface Booking {
-  id: string; // deterministic: YYYY-MM-DD_bedNumber_slot (e.g. 2026-07-04_12_morning)
+  id: string; // deterministic for legacy or random for new
   bedNumber: number;
   date: string; // YYYY-MM-DD
   slot: BookingSlot;
+  tipoPrenotazione?: BookingTipoPrenotazione;
+  risorse?: RisorsaOccupata[];
   customerId?: string;
   customerName: string;
   customerType: CustomerType;

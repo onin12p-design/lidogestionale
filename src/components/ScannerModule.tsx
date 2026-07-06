@@ -50,6 +50,13 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
         body: formData
       });
 
+      const contentType = response.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const textResult = await response.text();
+        console.error("Non-JSON response received:", textResult);
+        throw new Error(`Errore del server (${response.status}): risposta non valida dal server.`);
+      }
+
       const data = await response.json();
       if (!response.ok) {
         throw new Error(data.error || "Errore durante il parsing dei file.");
@@ -358,6 +365,7 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
                 {extractedItems.map((item) => {
                   const hasConflict = checkSingleBookingConflict(item.bedNumber, item.slot);
                   const isConflictWarning = hasConflict && item.importAction !== "overwrite";
+                  const isDaConfermare = item.notes?.toLowerCase().includes("da confermare");
 
                   return (
                     <tr
@@ -367,6 +375,8 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
                           ? "bg-rose-50/50"
                           : isConflictWarning
                           ? "bg-amber-50/70"
+                          : isDaConfermare
+                          ? "bg-amber-100/60 border-l-2 border-amber-500 hover:bg-amber-100/80"
                           : "hover:bg-slate-50/50"
                       }`}
                     >

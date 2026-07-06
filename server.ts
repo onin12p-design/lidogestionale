@@ -9,7 +9,7 @@ import mammoth from "mammoth";
 
 // Firebase web imports for server-side API proxying
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, getDocs, query, where } from "firebase/firestore";
+import { getFirestore, collection, getDocs, query, where, doc, getDoc } from "firebase/firestore";
 import { getAuth, signInAnonymously } from "firebase/auth";
 import firebaseConfig from "./firebase-applet-config.json";
 
@@ -195,6 +195,21 @@ function isValidDateRange(dateStr: string): boolean {
 // Cache store for availability queries (30 seconds TTL)
 const availabilityCache: Record<string, { timestamp: number; data: any }> = {};
 
+function getBedLettiniCountBackend(bedNum: number, bedsConfig: Record<string, any>): number {
+  if (bedsConfig && bedsConfig[String(bedNum)] !== undefined) {
+    return Number(bedsConfig[String(bedNum)]);
+  }
+  return 2; // Default
+}
+
+function getBedItemsBackend(bedNum: number, numLettini: number): string[] {
+  const items = ["ombrellone"];
+  for (let i = 1; i <= numLettini; i++) {
+    items.push(`lettino_${i}`);
+  }
+  return items;
+}
+
 // Public secure client-side API endpoint for beach availability
 app.get("/api/availability", async (req, res) => {
   try {
@@ -223,64 +238,397 @@ app.get("/api/availability", async (req, res) => {
     } catch (authErr: any) {
       console.error("Authentication failure before Firestore fetch:", authErr);
       res.status(500).json({
-        error: "Autenticazione non riuscita. Verificare la connessione o che il provider Anonimo sia abilitato nella console Firebase.",
+        error: "Autenticazione non riuscita. Verificare la connessione.",
         details: authErr.message || String(authErr)
       });
       return;
     }
 
+    // Fetch beds configuration
+    const bedsConfigRef = doc(db, "settings", "beds");
+    const bedsConfigSnap = await getDoc(bedsConfigRef);
+    const bedsConfig = bedsConfigSnap.exists() ? (bedsConfigSnap.data() as Record<string, any>) : {};
+
+    // Fetch bookings for specified date
     const bookingsQuery = query(collection(db, "bookings"), where("date", "==", date));
     const snapshot = await getDocs(bookingsQuery);
 
     // Map existing bookings by bed number
-    const bedBookings: Record<number, { morning?: boolean; afternoon?: boolean; full_day?: boolean }> = {};
+    const bedBookings: Record<number, any[]> = {};
     snapshot.forEach((docSnap) => {
       const data = docSnap.data();
       const bedNum = Number(data.bedNumber);
-      const slot = data.slot as string;
       if (!bedBookings[bedNum]) {
-        bedBookings[bedNum] = {};
+        bedBookings[bedNum] = [];
       }
-      if (slot === "morning") bedBookings[bedNum].morning = true;
-      if (slot === "afternoon") bedBookings[bedNum].afternoon = true;
-      if (slot === "full_day") bedBookings[bedNum].full_day = true;
+      bedBookings[bedNum].push(data);
     });
+
+    let totalItemsCount = 0;
+    let occupiedItemsCount = 0;
 
     // Build complete availability for all 109 beds
     const availabilityList = Array.from(VALID_BEDS).map((bedNum) => {
-      const bookings = bedBookings[bedNum];
+      const numLettini = getBedLettiniCountBackend(bedNum, bedsConfig);
+      const totalItems = numLettini + 1; // ombrellone + lettini
+      totalItemsCount += totalItems;
+
+      const bookings = bedBookings[bedNum] || [];
+      const defaultItems = getBedItemsBackend(bedNum, numLettini);
+
+      const itemMorningOccupied = new Set<string>();
+      const itemAfternoonOccupied = new Set<string>();
+
+      bookings.forEach((b) => {
+        let items: string[] = [];
+        if (b.risorse && b.risorse.length > 0) {
+          const res = b.risorse.find((r: any) => r.postazione === bedNum);
+          if (res) items = res.items;
+        } else {
+          // legacy fallback
+          items = defaultItems;
+        }
+
+        const isAbbonato = b.tipoPrenotazione === "abbonato";
+        const isFull = b.slot === "full_day" || isAbbonato;
+
+        if (b.slot === "morning") {
+          items.forEach(it => itemMorningOccupied.add(it));
+        } else if (b.slot === "afternoon") {
+          items.forEach(it => itemAfternoonOccupied.add(it));
+        } else if (isFull) {
+          items.forEach(it => {
+            itemMorningOccupied.add(it);
+            itemAfternoonOccupied.add(it);
+          });
+        }
+      });
+
+      const uniqueOccupiedItems = new Set<string>([...itemMorningOccupied, ...itemAfternoonOccupied]);
+      occupiedItemsCount += uniqueOccupiedItems.size;
+
       let status: "free" | "morning_free" | "afternoon_free" | "full" = "free";
 
-      if (bookings) {
-        if (bookings.full_day || (bookings.morning && bookings.afternoon)) {
-          status = "full";
-        } else if (bookings.morning) {
-          status = "afternoon_free"; // morning occupied -> afternoon free
-        } else if (bookings.afternoon) {
-          status = "morning_free"; // afternoon occupied -> morning free
+      const totalSlots = totalItems * 2;
+      const occupiedSlots = itemMorningOccupied.size + itemAfternoonOccupied.size;
+
+      if (occupiedSlots === 0) {
+        status = "free";
+      } else if (occupiedSlots === totalSlots) {
+        status = "full";
+      } else {
+        // Partial slot occupancy categories
+        if (itemMorningOccupied.size > 0 && itemAfternoonOccupied.size === 0) {
+          status = "afternoon_free";
+        } else if (itemAfternoonOccupied.size > 0 && itemMorningOccupied.size === 0) {
+          status = "morning_free";
+        } else {
+          status = "morning_free"; // default partial label
         }
       }
 
       return {
         bedNumber: bedNum,
-        status
+        status,
+        occupiedCount: uniqueOccupiedItems.size,
+        totalItems
       };
     });
+
+    const responseData = {
+      availability: availabilityList,
+      totalItemsCount,
+      occupiedItemsCount,
+      freeItemsCount: totalItemsCount - occupiedItemsCount
+    };
 
     // Save to Cache
     availabilityCache[date] = {
       timestamp: now,
-      data: availabilityList
+      data: responseData
     };
 
-    res.json(availabilityList);
+    res.json(responseData);
   } catch (error: any) {
     console.error("Errore nell'endpoint /api/availability:", error);
     res.status(500).json({ error: "Errore nel caricamento della disponibilità." });
   }
 });
 
-// API endpoint to parse uploaded files using Gemini
+// Helper to validate customer name
+function isValidCustomerName(name: string): boolean {
+  const clean = name.trim();
+  if (!clean) return false;
+  if (/^[.\-\s_]+$/.test(clean)) return false;
+  return true;
+}
+
+interface TableCell {
+  text: string;
+}
+type TableRow = TableCell[];
+type Table = TableRow[];
+
+// Helper to extract tables from mammoth HTML
+function parseHtmlTables(html: string): Table[] {
+  const tables: Table[] = [];
+  const tableRegex = /<table[^>]*>([\s\S]*?)<\/table>/gi;
+  let tableMatch;
+  
+  while ((tableMatch = tableRegex.exec(html)) !== null) {
+    const tableHtml = tableMatch[1];
+    const rows: TableRow[] = [];
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let rowMatch;
+    
+    while ((rowMatch = rowRegex.exec(tableHtml)) !== null) {
+      const rowHtml = rowMatch[1];
+      const cells: TableCell[] = [];
+      const cellRegex = /<(td|th)[^>]*>([\s\S]*?)<\/\1>/gi;
+      let cellMatch;
+      
+      while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+        let cellContent = cellMatch[2];
+        cellContent = cellContent.replace(/<[^>]+>/g, " ");
+        cellContent = cellContent
+          .replace(/&nbsp;/gi, " ")
+          .replace(/&amp;/gi, "&")
+          .replace(/&lt;/gi, "<")
+          .replace(/&gt;/gi, ">")
+          .replace(/&quot;/gi, '"');
+        
+        const cleanText = cellContent.replace(/\s+/g, " ").trim();
+        cells.push({ text: cleanText });
+      }
+      if (cells.length > 0) {
+        rows.push(cells);
+      }
+    }
+    if (rows.length > 0) {
+      tables.push(rows);
+    }
+  }
+  
+  return tables;
+}
+
+// Deterministic parser for DOCX beach map records
+async function parseDocxDeterministic(buffer: Buffer, originalName: string) {
+  const convertResult = await mammoth.convertToHtml({ buffer });
+  const html = convertResult.value;
+
+  const tables = parseHtmlTables(html);
+  if (tables.length === 0) {
+    throw new Error("Nessuna tabella trovata nel documento DOCX.");
+  }
+
+  // 1. Identify pedana (Sinistra: 1-34 vs Destra: 60-109)
+  let pedana: "sinistra" | "destra" | null = null;
+  for (const table of tables) {
+    for (const row of table) {
+      for (const cell of row) {
+        const text = cell.text.toUpperCase();
+        if (text.includes("PEDANA SINISTRA")) {
+          pedana = "sinistra";
+          break;
+        } else if (text.includes("PEDANA DESTRA")) {
+          pedana = "destra";
+          break;
+        }
+      }
+      if (pedana) break;
+    }
+    if (pedana) break;
+  }
+
+  // Fallback to filename
+  if (!pedana) {
+    const lowerName = originalName.toLowerCase();
+    if (lowerName.includes("sx") || lowerName.includes("sinistra")) {
+      pedana = "sinistra";
+    } else if (lowerName.includes("dx") || lowerName.includes("destra")) {
+      pedana = "destra";
+    } else {
+      pedana = "sinistra";
+    }
+  }
+
+  const startBed = pedana === "sinistra" ? 1 : 60;
+  const maxRows = pedana === "sinistra" ? 34 : 50;
+
+  // 2. Find table with the header row
+  let dataTable: Table | null = null;
+  let headerRowIndex = -1;
+
+  for (const table of tables) {
+    for (let rIndex = 0; rIndex < table.length; rIndex++) {
+      const row = table[rIndex];
+      const hasMattina = row.some(cell => cell.text.toUpperCase().includes("MATTINA"));
+      const hasPomeriggio = row.some(cell => cell.text.toUpperCase().includes("POMERIGGIO"));
+      if (hasMattina && hasPomeriggio) {
+        dataTable = table;
+        headerRowIndex = rIndex;
+        break;
+      }
+    }
+    if (dataTable) break;
+  }
+
+  if (!dataTable || headerRowIndex === -1) {
+    throw new Error("Impossibile trovare la tabella dati delle prenotazioni (colonne MATTINA / POMERIGGIO mancanti).");
+  }
+
+  const items: any[] = [];
+  const dataRows = dataTable.slice(headerRowIndex + 1);
+  const rowsToProcess = dataRows.slice(0, maxRows);
+
+  for (let i = 0; i < rowsToProcess.length; i++) {
+    const rowCells = rowsToProcess[i];
+    const bedNumber = startBed + i;
+    const isValidBed = VALID_BEDS.has(bedNumber);
+
+    const mattinaNameRaw = rowCells[1]?.text || "";
+    const pomeriggioNameRaw = rowCells[5]?.text || "";
+
+    const mattinaClean = mattinaNameRaw.trim();
+    const pomeriggioClean = pomeriggioNameRaw.trim();
+
+    const hasMattina = isValidCustomerName(mattinaClean);
+    const hasPomeriggio = isValidCustomerName(pomeriggioClean);
+
+    // Extract L/P/€ markings
+    const mL = rowCells[2]?.text || "";
+    const mP = rowCells[3]?.text || "";
+    const mE = rowCells[4]?.text || "";
+    const mattinaMarcature = [mL, mP, mE].map(s => s.trim()).filter(Boolean).join(" ");
+
+    const pL = rowCells[6]?.text || "";
+    const pP = rowCells[7]?.text || "";
+    const pE = rowCells[8]?.text || "";
+    const pomeriggioMarcature = [pL, pP, pE].map(s => s.trim()).filter(Boolean).join(" ");
+
+    const daConfermareM = mattinaNameRaw.toLowerCase().includes("da confermare");
+    const daConfermareP = pomeriggioNameRaw.toLowerCase().includes("da confermare");
+
+    const cleanCustomerName = (rawName: string): string => {
+      let name = rawName.replace(/da confermare/gi, "").replace(/\s+/g, " ").trim();
+      if (!name || /^[.\-\s_]+$/.test(name)) {
+        return "Cliente";
+      }
+      return name;
+    };
+
+    const buildNotes = (baseMarcature: string, isDaConfermare: boolean): string => {
+      const parts: string[] = [];
+      if (baseMarcature) {
+        parts.push(`Segnato: ${baseMarcature}`);
+      }
+      if (isDaConfermare) {
+        parts.push("Da confermare");
+      }
+      return parts.join(" | ");
+    };
+
+    if (hasMattina && hasPomeriggio) {
+      if (mattinaClean.toUpperCase() === pomeriggioClean.toUpperCase()) {
+        const finalName = cleanCustomerName(mattinaClean);
+        const isConfirm = daConfermareM || daConfermareP || mattinaClean.toLowerCase().includes("da confermare") || pomeriggioClean.toLowerCase().includes("da confermare");
+
+        let finalMarcNotes = "";
+        if (mattinaMarcature && pomeriggioMarcature) {
+          if (mattinaMarcature === pomeriggioMarcature) {
+            finalMarcNotes = mattinaMarcature;
+          } else {
+            finalMarcNotes = `mattina: ${mattinaMarcature}, pomeriggio: ${pomeriggioMarcature}`;
+          }
+        } else {
+          finalMarcNotes = mattinaMarcature || pomeriggioMarcature;
+        }
+
+        const notes = buildNotes(finalMarcNotes, isConfirm);
+        const isSubscriber = finalName.toLowerCase().includes("abbonato") || 
+                             notes.toLowerCase().includes("abbonato") ||
+                             rowCells.some(c => c?.text?.toLowerCase().includes("abbonato"));
+
+        items.push({
+          bedNumber,
+          customerName: finalName,
+          customerType: isSubscriber ? "subscriber" : "daily",
+          slot: "full_day",
+          notes,
+          isValidBed,
+          fileName: originalName
+        });
+      } else {
+        // Morning booking
+        const mName = cleanCustomerName(mattinaClean);
+        const mConfirm = daConfermareM || mattinaClean.toLowerCase().includes("da confermare");
+        const mNotes = buildNotes(mattinaMarcature, mConfirm);
+        const mSub = mName.toLowerCase().includes("abbonato") || mNotes.toLowerCase().includes("abbonato") || rowCells.some(c => c?.text?.toLowerCase().includes("abbonato"));
+
+        items.push({
+          bedNumber,
+          customerName: mName,
+          customerType: mSub ? "subscriber" : "daily",
+          slot: "morning",
+          notes: mNotes,
+          isValidBed,
+          fileName: originalName
+        });
+
+        // Afternoon booking
+        const pName = cleanCustomerName(pomeriggioClean);
+        const pConfirm = daConfermareP || pomeriggioClean.toLowerCase().includes("da confermare");
+        const pNotes = buildNotes(pomeriggioMarcature, pConfirm);
+        const pSub = pName.toLowerCase().includes("abbonato") || pNotes.toLowerCase().includes("abbonato") || rowCells.some(c => c?.text?.toLowerCase().includes("abbonato"));
+
+        items.push({
+          bedNumber,
+          customerName: pName,
+          customerType: pSub ? "subscriber" : "daily",
+          slot: "afternoon",
+          notes: pNotes,
+          isValidBed,
+          fileName: originalName
+        });
+      }
+    } else if (hasMattina) {
+      const mName = cleanCustomerName(mattinaClean);
+      const mConfirm = daConfermareM || mattinaClean.toLowerCase().includes("da confermare");
+      const mNotes = buildNotes(mattinaMarcature, mConfirm);
+      const mSub = mName.toLowerCase().includes("abbonato") || mNotes.toLowerCase().includes("abbonato") || rowCells.some(c => c?.text?.toLowerCase().includes("abbonato"));
+
+      items.push({
+        bedNumber,
+        customerName: mName,
+        customerType: mSub ? "subscriber" : "daily",
+        slot: "morning",
+        notes: mNotes,
+        isValidBed,
+        fileName: originalName
+      });
+    } else if (hasPomeriggio) {
+      const pName = cleanCustomerName(pomeriggioClean);
+      const pConfirm = daConfermareP || pomeriggioClean.toLowerCase().includes("da confermare");
+      const pNotes = buildNotes(pomeriggioMarcature, pConfirm);
+      const pSub = pName.toLowerCase().includes("abbonato") || pNotes.toLowerCase().includes("abbonato") || rowCells.some(c => c?.text?.toLowerCase().includes("abbonato"));
+
+      items.push({
+        bedNumber,
+        customerName: pName,
+        customerType: pSub ? "subscriber" : "daily",
+        slot: "afternoon",
+        notes: pNotes,
+        isValidBed,
+        fileName: originalName
+      });
+    }
+  }
+
+  return items;
+}
+
+// API endpoint to parse uploaded files using Gemini or deterministic parser
 app.post("/api/parse-scanner", upload.array("files"), async (req, res) => {
   try {
     const files = req.files as Express.Multer.File[];
@@ -289,7 +637,6 @@ app.post("/api/parse-scanner", upload.array("files"), async (req, res) => {
       return;
     }
 
-    const ai = getGemini();
     const allExtractedItems: any[] = [];
     const errors: string[] = [];
 
@@ -298,7 +645,22 @@ app.post("/api/parse-scanner", upload.array("files"), async (req, res) => {
         const isDocx = file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || 
                        file.originalname.toLowerCase().endsWith(".docx");
 
-        const promptText = `
+        if (isDocx) {
+          // Bypassing Gemini: use the fast, free, accurate deterministic parser
+          console.log(`Deterministic parsing DOCX file: ${file.originalname}`);
+          try {
+            const docxItems = await parseDocxDeterministic(file.buffer, file.originalname);
+            allExtractedItems.push(...docxItems);
+          } catch (docxErr: any) {
+            console.error(`Errore nel parser DOCX per il file ${file.originalname}:`, docxErr);
+            errors.push(`File ${file.originalname}: Errore di parsing deterministico: ${docxErr.message || String(docxErr)}`);
+          }
+        } else {
+          // Keep Gemini pathway for images
+          console.log(`AI-assisted parsing image file: ${file.originalname}`);
+          try {
+            const ai = getGemini();
+            const promptText = `
 Estrai tutte le prenotazioni o registrazioni del lido presenti in questo documento o immagine.
 Estrai un elenco strutturato con le seguenti informazioni per ciascuna riga trovata:
 - bedNumber: il numero del lettino (un intero tra 1 e 109).
@@ -309,96 +671,89 @@ Estrai un elenco strutturato con le seguenti informazioni per ciascuna riga trov
 
 Se trovi righe che fanno riferimento a lettini multipli (es. 'Lettini 12 e 13'), crea righe separate per ciascun lettino.
 Restituisci solo un array di oggetti validi secondo la risposta strutturata JSON richiesta.
-        `;
+            `;
 
-        let contents: any[] = [];
+            const base64Data = file.buffer.toString("base64");
+            const filePart = {
+              inlineData: {
+                mimeType: file.mimetype,
+                data: base64Data
+              }
+            };
+            const contents = [
+              filePart,
+              { text: promptText }
+            ];
 
-        if (isDocx) {
-          const mammothResult = await mammoth.extractRawText({ buffer: file.buffer });
-          const docxText = mammothResult.value;
-          contents = [
-            { text: `CONTENUTO DEL DOCUMENTO WORD:\n${docxText}` },
-            { text: promptText }
-          ];
-        } else {
-          const base64Data = file.buffer.toString("base64");
-          const filePart = {
-            inlineData: {
-              mimeType: file.mimetype,
-              data: base64Data
-            }
-          };
-          contents = [
-            filePart,
-            { text: promptText }
-          ];
-        }
-
-        const response = await generateContentWithRetry(ai, {
-          model: "gemini-3.5-flash",
-          contents,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                items: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      bedNumber: {
-                        type: Type.INTEGER,
-                        description: "Il numero del lettino (1-109)."
-                      },
-                      customerName: {
-                        type: Type.STRING,
-                        description: "Il nome completo o identificativo del cliente."
-                      },
-                      customerType: {
-                        type: Type.STRING,
-                        enum: ["daily", "subscriber"],
-                        description: "Tipo di cliente: daily o subscriber."
-                      },
-                      slot: {
-                        type: Type.STRING,
-                        enum: ["morning", "afternoon", "full_day"],
-                        description: "Fascia oraria della prenotazione."
-                      },
-                      notes: {
-                        type: Type.STRING,
-                        description: "Eventuali note estratte."
+            const response = await generateContentWithRetry(ai, {
+              model: "gemini-2.5-flash",
+              contents,
+              config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    items: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          bedNumber: {
+                            type: Type.INTEGER,
+                            description: "Il numero del lettino (1-109)."
+                          },
+                          customerName: {
+                            type: Type.STRING,
+                            description: "Il nome completo o identificativo del cliente."
+                          },
+                          customerType: {
+                            type: Type.STRING,
+                            enum: ["daily", "subscriber"],
+                            description: "Tipo di cliente: daily o subscriber."
+                          },
+                          slot: {
+                            type: Type.STRING,
+                            enum: ["morning", "afternoon", "full_day"],
+                            description: "Fascia oraria della prenotazione."
+                          },
+                          notes: {
+                            type: Type.STRING,
+                            description: "Eventuali note estratte."
+                          }
+                        },
+                        required: ["bedNumber", "customerName", "customerType", "slot"]
                       }
-                    },
-                    required: ["bedNumber", "customerName", "customerType", "slot"]
-                  }
+                    }
+                  },
+                  required: ["items"]
                 }
-              },
-              required: ["items"]
-            }
-          }
-        });
-
-        const textResult = response.text;
-        if (textResult) {
-          const parsed = JSON.parse(textResult.trim());
-          if (parsed && Array.isArray(parsed.items)) {
-            parsed.items.forEach((item: any) => {
-              // Perform validation on bed number
-              const num = Number(item.bedNumber);
-              const isValid = VALID_BEDS.has(num);
-              
-              allExtractedItems.push({
-                ...item,
-                bedNumber: num,
-                isValidBed: isValid,
-                fileName: file.originalname
-              });
+              }
             });
+
+            const textResult = response.text;
+            if (textResult) {
+              const parsed = JSON.parse(textResult.trim());
+              if (parsed && Array.isArray(parsed.items)) {
+                parsed.items.forEach((item: any) => {
+                  const num = Number(item.bedNumber);
+                  const isValid = VALID_BEDS.has(num);
+                  
+                  allExtractedItems.push({
+                    ...item,
+                    bedNumber: num,
+                    isValidBed: isValid,
+                    fileName: file.originalname
+                  });
+                });
+              }
+            }
+          } catch (geminiErr: any) {
+            console.error(`Errore nel parser Gemini per il file ${file.originalname}:`, geminiErr);
+            errors.push(`File ${file.originalname}: Errore di analisi AI: ${geminiErr.message || String(geminiErr)}`);
           }
         }
       } catch (err: any) {
-        console.error("Errore nel parsing del singolo file:", err);
+        console.error("Errore generico nel ciclo file:", err);
         errors.push(`File ${file.originalname}: ${err.message || String(err)}`);
       }
     }
@@ -412,6 +767,15 @@ Restituisci solo un array di oggetti validi secondo la risposta strutturata JSON
     console.error("Errore generale nell'endpoint /api/parse-scanner:", error);
     res.status(500).json({ error: error.message || "Errore durante l'elaborazione dei documenti con Gemini." });
   }
+});
+
+// Global error handling middleware to prevent HTML error pages and always return JSON
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("Unhandled global server error:", err);
+  res.status(err.status || 500).json({
+    error: err.message || "Errore interno del server.",
+    details: process.env.NODE_ENV !== "production" ? err.stack || String(err) : undefined
+  });
 });
 
 // Setup Vite Dev Server / Static files

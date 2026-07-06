@@ -1,6 +1,6 @@
 import { initializeApp } from "firebase/app";
 import { getAuth, signInAnonymously, onAuthStateChanged, User } from "firebase/auth";
-import { getFirestore, doc, getDocFromServer } from "firebase/firestore";
+import { getFirestore, doc, getDocFromServer, collection, query, where, runTransaction, getDocs } from "firebase/firestore";
 import firebaseConfig from "../../firebase-applet-config.json";
 
 // Initialize Firebase App
@@ -90,9 +90,8 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
 }
 
 // Anti double-booking transactional helper function (P1)
-import { runTransaction } from "firebase/firestore";
 import { Booking } from "../types";
-import { sanitizeForFirestore } from "../utils";
+import { sanitizeForFirestore, getBedLettiniCount, getBedItems, hasConflict } from "../utils";
 
 export interface TransactionResult {
   success: boolean;
@@ -105,61 +104,76 @@ export async function createBookingTransactional(booking: Omit<Booking, "id" | "
   const bed = booking.bedNumber;
   const slot = booking.slot;
 
-  // Generate the document IDs for the 3 potential slots of this bed/date
-  const morningId = `${date}_${bed}_morning`;
-  const afternoonId = `${date}_${bed}_afternoon`;
-  const fullDayId = `${date}_${bed}_full_day`;
-
-  // Doc references
-  const morningRef = doc(db, "bookings", morningId);
-  const afternoonRef = doc(db, "bookings", afternoonId);
-  const fullDayRef = doc(db, "bookings", fullDayId);
-
   try {
+    // 1. Fetch all bookings for the specified date outside the transaction
+    const bookingsQuery = query(
+      collection(db, "bookings"),
+      where("date", "==", date)
+    );
+    const bookingsSnap = await getDocs(bookingsQuery);
+
+    // 2. Define our serialization lock for this date to prevent concurrent write anomalies (phantom reads)
+    const lockRef = doc(db, "bookings_locks", date);
+
     const result = await runTransaction(db, async (transaction) => {
-      // 1. Read all 3 documents
-      const morningSnap = await transaction.get(morningRef);
-      const afternoonSnap = await transaction.get(afternoonRef);
-      const fullDaySnap = await transaction.get(fullDayRef);
+      // a. Read the lock document to force serialization of concurrent bookings on the same date
+      await transaction.get(lockRef);
 
-      const hasMorning = morningSnap.exists();
-      const hasAfternoon = afternoonSnap.exists();
-      const hasFullDay = fullDaySnap.exists();
+      // b. Read the beds configuration to resolve bed item counts dynamically
+      const bedsConfigRef = doc(db, "settings", "beds");
+      const bedsConfigSnap = await transaction.get(bedsConfigRef);
+      const bedsConfig = bedsConfigSnap.exists() ? (bedsConfigSnap.data() as Record<number, number>) : {};
 
-      // Get names of customers holding existing slots for description
-      const morningName = hasMorning ? morningSnap.data()?.customerName || "Qualcuno" : "";
-      const afternoonName = hasAfternoon ? afternoonSnap.data()?.customerName || "Qualcuno" : "";
-      const fullDayName = hasFullDay ? fullDaySnap.data()?.customerName || "Qualcuno" : "";
+      // c. Transactionally read all existing bookings of the date we fetched
+      const freshBookingSnaps = [];
+      for (const d of bookingsSnap.docs) {
+        freshBookingSnaps.push(await transaction.get(d.ref));
+      }
 
-      // 2. Compatibility rules check
-      if (slot === "full_day") {
-        if (hasFullDay) {
-          throw new Error(`Lettino ${bed} già occupato per la fascia Giornata Intera da ${fullDayName}`);
-        }
-        if (hasMorning) {
-          throw new Error(`Lettino ${bed} già occupato per la fascia Mattina da ${morningName}`);
-        }
-        if (hasAfternoon) {
-          throw new Error(`Lettino ${bed} già occupato per la fascia Pomeriggio da ${afternoonName}`);
-        }
-      } else if (slot === "morning") {
-        if (hasFullDay) {
-          throw new Error(`Lettino ${bed} già occupato per la fascia Giornata Intera da ${fullDayName}`);
-        }
-        if (hasMorning) {
-          throw new Error(`Lettino ${bed} già occupato per la fascia Mattina da ${morningName}`);
-        }
-      } else if (slot === "afternoon") {
-        if (hasFullDay) {
-          throw new Error(`Lettino ${bed} già occupato per la fascia Giornata Intera da ${fullDayName}`);
-        }
-        if (hasAfternoon) {
-          throw new Error(`Lettino ${bed} già occupato per la fascia Pomeriggio da ${afternoonName}`);
+      const existingBookings = freshBookingSnaps
+        .filter((snap) => snap.exists())
+        .map((snap) => ({ id: snap.id, ...snap.data() } as Booking));
+
+      // d. Populate target resources of the new booking
+      const numLettini = getBedLettiniCount(bed, bedsConfig);
+      const defaultItems = getBedItems(bed, numLettini);
+      const risorse = booking.risorse && booking.risorse.length > 0
+        ? booking.risorse
+        : [{ postazione: bed, items: defaultItems }];
+
+      // e. Perform central conflict checks for each resource
+      for (const res of risorse) {
+        const bedNum = res.postazione;
+        for (const item of res.items) {
+          const itemBookings: any[] = [];
+          
+          existingBookings.forEach((eb) => {
+            let ebItems: string[] = [];
+            if (eb.risorse && eb.risorse.length > 0) {
+              const ebRes = eb.risorse.find((r) => r.postazione === bedNum);
+              if (ebRes) {
+                ebItems = ebRes.items;
+              }
+            } else {
+              // Legacy booking on the same bed: occupies all items
+              if (eb.bedNumber === bedNum) {
+                const ebNumLettini = getBedLettiniCount(bedNum, bedsConfig);
+                ebItems = getBedItems(bedNum, ebNumLettini);
+              }
+            }
+            if (ebItems.includes(item)) {
+              itemBookings.push(eb);
+            }
+          });
+
+          if (hasConflict(itemBookings, slot)) {
+            throw new Error(`Conflitto sulla postazione ${bedNum}, risorsa '${item === 'ombrellone' ? 'ombrellone' : 'lettino'}' già occupata per la fascia selezionata.`);
+          }
         }
       }
 
-      // 3. Write booking if compatible
-      const targetId = `${date}_${bed}_${slot}`;
+      // f. Write the new booking with a unique random document ID
+      const targetId = doc(collection(db, "bookings")).id;
       const targetRef = doc(db, "bookings", targetId);
 
       const finalBooking: Booking = {
@@ -167,6 +181,8 @@ export async function createBookingTransactional(booking: Omit<Booking, "id" | "
         bedNumber: bed,
         date: date,
         slot: slot,
+        tipoPrenotazione: booking.tipoPrenotazione || "intera",
+        risorse: risorse,
         customerId: booking.customerId || "",
         customerName: booking.customerName,
         customerType: booking.customerType,
@@ -177,6 +193,10 @@ export async function createBookingTransactional(booking: Omit<Booking, "id" | "
       };
 
       transaction.set(targetRef, sanitizeForFirestore(finalBooking));
+      
+      // Update lock to force serialization of successive transactions
+      transaction.set(lockRef, { lastUpdated: new Date().toISOString() });
+
       return finalBooking;
     });
 

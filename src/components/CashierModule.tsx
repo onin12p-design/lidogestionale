@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { Booking, Tab, Payment, PaymentMethod, PaymentKind, TabItem } from "../types";
 import { getFirestore, setDoc, doc, collection, addDoc, getDocs, writeBatch, serverTimestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../lib/firebase";
-import { sanitizeForFirestore, getPriceForBooking } from "../utils";
+import { sanitizeForFirestore, getPriceForBooking, getBookingPriceProportional } from "../utils";
 import { Coffee, CreditCard, Euro, CheckCircle, Search, Clock, AlertTriangle, Plus, Trash } from "lucide-react";
 
 interface CashierModuleProps {
@@ -11,10 +11,12 @@ interface CashierModuleProps {
   tabs: Tab[];
   payments: Payment[];
   pricingConfigs?: any[];
+  bedsConfig?: Record<number, number>;
+  rowsConfig?: Record<number, number>;
   onRefresh: () => void;
 }
 
-export default function CashierModule({ currentDate, bookings, tabs, payments, pricingConfigs = [], onRefresh }: CashierModuleProps) {
+export default function CashierModule({ currentDate, bookings, tabs, payments, pricingConfigs = [], bedsConfig = {}, rowsConfig = {}, onRefresh }: CashierModuleProps) {
   const [saving, setSaving] = useState(false);
   
   // Tab quick adding items
@@ -34,7 +36,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
     const bPayments = payments.filter((p) => p.bookingId === booking.id);
     const paidSum = bPayments.reduce((sum, p) => sum + p.amount, 0);
 
-    let expectedPrice = getPriceForBooking(booking.date, booking.bedNumber, booking.slot, pricingConfigs);
+    let expectedPrice = getBookingPriceProportional(booking, pricingConfigs, bedsConfig, rowsConfig);
     const balance = expectedPrice - paidSum;
 
     let payStatus: "paid" | "partial" | "unpaid" = "unpaid";

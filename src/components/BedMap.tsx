@@ -1,7 +1,7 @@
 import React from "react";
-import { Booking, Tab, Payment } from "../types";
+import { Booking, Tab, Payment, BOOKING_TYPE_COLORS, BookingTipoPrenotazione } from "../types";
 import { Coffee, CheckCircle, AlertCircle, HelpCircle } from "lucide-react";
-import { getPriceForBooking } from "../utils";
+import { getPriceForBooking, getBedLettiniCount, getBedItems, getBookingPriceProportional } from "../utils";
 
 // PEDANA SINISTRA — griglia sinistra (4 righe, ultima riga da 4)
 export const PEDANA_SINISTRA_LEFT = [
@@ -45,6 +45,8 @@ interface BedMapProps {
   isExpanded?: boolean;
   availability?: { bedNumber: number; status: "free" | "morning_free" | "afternoon_free" | "full" }[];
   pricingConfigs?: any[];
+  bedsConfig?: Record<number, number>;
+  rowsConfig?: Record<number, number>;
 }
 
 export default function BedMap({
@@ -56,37 +58,163 @@ export default function BedMap({
   isClientView = false,
   isExpanded = false,
   availability = [],
-  pricingConfigs = []
+  pricingConfigs = [],
+  bedsConfig = {},
+  rowsConfig = {}
 }: BedMapProps) {
   
-  // Helper to get booking details for a bed number
-  const getBedBookingStatus = (bedNum: number) => {
+  // Helper to get visual status and bookings details for a bed number
+  const getBedVisualStatus = (bedNum: number) => {
+    const numLettini = getBedLettiniCount(bedNum, bedsConfig);
+    const totalItems = numLettini + 1; // ombrellone + lettini
+    const allPossibleItems = getBedItems(bedNum, numLettini);
+
     if (isClientView) {
-      const found = availability.find((a) => a.bedNumber === bedNum);
+      const found = availability.find((a) => a.bedNumber === bedNum) as any;
       const status = found ? found.status : "free";
-      return { state: status, isSubscriber: false, bookingsOnBed: [] };
+      const occupiedCount = found && found.occupiedCount !== undefined ? found.occupiedCount : (status === "full" ? totalItems : (status === "free" ? 0 : 1));
+      const totItems = found && found.totalItems !== undefined ? found.totalItems : totalItems;
+
+      let style: React.CSSProperties = {};
+      if (status === "full") {
+        style = { backgroundColor: "rgba(243, 239, 230, 0.8)" };
+      } else if (status === "morning_free") {
+        style = {
+          background: `linear-gradient(0deg, rgba(243, 239, 230, 0.8) 50%, #EAF4F6 50%)`
+        };
+      } else if (status === "afternoon_free") {
+        style = {
+          background: `linear-gradient(180deg, rgba(243, 239, 230, 0.8) 50%, #EAF4F6 50%)`
+        };
+      } else {
+        style = { backgroundColor: "#EAF4F6" };
+      }
+
+      return {
+        state: status,
+        isSubscriber: false,
+        bookingsOnBed: [],
+        occupiedCount,
+        totalItems: totItems,
+        style
+      };
     }
 
-    const bedBookings = bookings.filter((b) => b.bedNumber === bedNum);
-    if (bedBookings.length === 0) return { state: "free", bookingsOnBed: [] };
+    // Find all bookings for this bed on this day
+    const bedBookings = bookings.filter((b) => {
+      if (b.risorse && b.risorse.length > 0) {
+        return b.risorse.some((r) => r.postazione === bedNum);
+      }
+      return b.bedNumber === bedNum;
+    });
 
-    const morning = bedBookings.find((b) => b.slot === "morning");
-    const afternoon = bedBookings.find((b) => b.slot === "afternoon");
-    const fullDay = bedBookings.find((b) => b.slot === "full_day");
-
-    let isSubscriber = bedBookings.some((b) => b.customerType === "subscriber");
-
-    if (fullDay) {
-      return { state: "full_day", isSubscriber, bookingsOnBed: [fullDay] };
-    } else if (morning && afternoon) {
-      return { state: "split_full_day", isSubscriber, bookingsOnBed: [morning, afternoon] };
-    } else if (morning) {
-      return { state: "morning", isSubscriber, bookingsOnBed: [morning] };
-    } else if (afternoon) {
-      return { state: "afternoon", isSubscriber, bookingsOnBed: [afternoon] };
+    if (bedBookings.length === 0) {
+      return {
+        state: "free",
+        isSubscriber: false,
+        bookingsOnBed: [],
+        occupiedCount: 0,
+        totalItems,
+        style: { backgroundColor: BOOKING_TYPE_COLORS.free }
+      };
     }
 
-    return { state: "free", bookingsOnBed: [] };
+    // Check which items are occupied for morning and afternoon
+    const morningOccupied = new Set<string>();
+    const afternoonOccupied = new Set<string>();
+    const isSubscriber = bedBookings.some((b) => b.customerType === "subscriber");
+
+    bedBookings.forEach((b) => {
+      // Resolve occupied items for this booking on this bed
+      let occupiedItems: string[] = [];
+      if (b.risorse && b.risorse.length > 0) {
+        const res = b.risorse.find((r) => r.postazione === bedNum);
+        if (res) occupiedItems = res.items;
+      } else {
+        // Legacy fallback: occupies all items
+        occupiedItems = allPossibleItems;
+      }
+
+      if (b.slot === "morning") {
+        occupiedItems.forEach(item => morningOccupied.add(item));
+      } else if (b.slot === "afternoon") {
+        occupiedItems.forEach(item => afternoonOccupied.add(item));
+      } else if (b.slot === "full_day") {
+        occupiedItems.forEach(item => {
+          morningOccupied.add(item);
+          afternoonOccupied.add(item);
+        });
+      }
+    });
+
+    // Find unique items occupied at any point in the day
+    const uniqueOccupied = new Set<string>([...morningOccupied, ...afternoonOccupied]);
+    const occupiedCount = uniqueOccupied.size;
+
+    // Determine visual types
+    const morningBookings = bedBookings.filter(b => b.slot === "morning" || b.slot === "full_day");
+    const afternoonBookings = bedBookings.filter(b => b.slot === "afternoon" || b.slot === "full_day");
+
+    // Resolve colors
+    const getBookingColor = (bList: Booking[]) => {
+      if (bList.length === 0) return null;
+      // Find highest priority type: abbonato > intera > mattina/pomeriggio
+      const hasSubscriber = bList.some(b => b.customerType === "subscriber" || b.tipoPrenotazione === "abbonato");
+      if (hasSubscriber) return BOOKING_TYPE_COLORS.abbonato;
+
+      const types = bList.map(b => b.tipoPrenotazione).filter(Boolean);
+      if (types.includes("abbonato")) return BOOKING_TYPE_COLORS.abbonato;
+      if (types.includes("intera")) return BOOKING_TYPE_COLORS.intera;
+      if (types.includes("pomeriggio")) return BOOKING_TYPE_COLORS.pomeriggio;
+      if (types.includes("mattina")) return BOOKING_TYPE_COLORS.mattina;
+
+      // Fallback from slot
+      const slots = bList.map(b => b.slot);
+      if (slots.includes("full_day")) return BOOKING_TYPE_COLORS.intera;
+      if (slots.includes("morning")) return BOOKING_TYPE_COLORS.mattina;
+      if (slots.includes("afternoon")) return BOOKING_TYPE_COLORS.pomeriggio;
+
+      return BOOKING_TYPE_COLORS.intera;
+    };
+
+    const morningColor = getBookingColor(morningBookings);
+    const afternoonColor = getBookingColor(afternoonBookings);
+
+    let style: React.CSSProperties = {};
+    let stateLabel = "free";
+
+    if (morningColor && afternoonColor && morningColor !== afternoonColor) {
+      // Diagonal split!
+      style = {
+        background: `linear-gradient(135deg, ${morningColor} 50%, ${afternoonColor} 50%)`
+      };
+      stateLabel = "split_full_day";
+    } else if (morningColor && afternoonColor) {
+      style = { backgroundColor: morningColor };
+      stateLabel = "full_day";
+    } else if (morningColor) {
+      style = {
+        background: `linear-gradient(180deg, ${morningColor} 50%, ${BOOKING_TYPE_COLORS.free} 50%)`
+      };
+      stateLabel = "morning";
+    } else if (afternoonColor) {
+      style = {
+        background: `linear-gradient(0deg, ${afternoonColor} 50%, ${BOOKING_TYPE_COLORS.free} 50%)`
+      };
+      stateLabel = "afternoon";
+    } else {
+      style = { backgroundColor: BOOKING_TYPE_COLORS.free };
+      stateLabel = "free";
+    }
+
+    return {
+      state: stateLabel,
+      isSubscriber,
+      bookingsOnBed: bedBookings,
+      occupiedCount,
+      totalItems,
+      style
+    };
   };
 
   // Helper to get payment and tab indicator for a bed
@@ -110,7 +238,7 @@ export default function BedMap({
         sPayments.forEach(p => totalPaid += p.amount);
       }
 
-      expectedPrice += getPriceForBooking(booking.date, booking.bedNumber, booking.slot, pricingConfigs);
+      expectedPrice += getBookingPriceProportional(booking, pricingConfigs, bedsConfig, rowsConfig);
     });
 
     let paymentStatus: "paid" | "unpaid" | "deposit" = "unpaid";
@@ -164,7 +292,7 @@ export default function BedMap({
       return <div key={key} className="w-full aspect-square bg-transparent"></div>;
     }
 
-    const { state, isSubscriber, bookingsOnBed } = getBedBookingStatus(bedNum);
+    const { state, isSubscriber, bookingsOnBed, occupiedCount, totalItems, style } = getBedVisualStatus(bedNum);
     const { payment, hasOpenTab } = getBedIndicators(bedNum, bookingsOnBed);
     const isSelected = selectedBed === bedNum;
 
@@ -191,21 +319,9 @@ export default function BedMap({
       if (state === "free") {
         bgClass = "bg-[#EAF4F6] border-[#B3D5DC] hover:bg-[#D5EAEF] hover:border-[#025A70]";
         textClass = "text-[#025A70] font-bold";
-      } else if (state === "full_day" || state === "split_full_day") {
-        bgClass = isSubscriber 
-          ? "bg-[#F9F1E2] border-[#E2D1B3] hover:bg-[#F2E4CD]" 
-          : "bg-[#D5EAEF] border-[#99CCD6] hover:bg-[#BBDDE5]";
-        textClass = isSubscriber ? "text-[#8A6D3B] font-extrabold" : "text-[#025A70] font-extrabold";
-      } else if (state === "morning") {
-        bgClass = isSubscriber
-          ? "bg-gradient-to-b from-[#F9F1E2] via-[#FDFAED] to-white border-[#E2D1B3]"
-          : "bg-gradient-to-b from-[#D5EAEF] via-[#EAF4F6] to-white border-[#99CCD6]";
-        textClass = isSubscriber ? "text-[#8A6D3B] font-bold" : "text-[#025A70] font-bold";
-      } else if (state === "afternoon") {
-        bgClass = isSubscriber
-          ? "bg-gradient-to-t from-[#F9F1E2] via-[#FDFAED] to-white border-[#E2D1B3]"
-          : "bg-gradient-to-t from-[#D5EAEF] via-[#EAF4F6] to-white border-[#99CCD6]";
-        textClass = isSubscriber ? "text-[#8A6D3B] font-bold" : "text-[#025A70] font-bold";
+      } else {
+        bgClass = "border-slate-300 hover:border-slate-500 shadow-sm";
+        textClass = "text-slate-800 font-extrabold";
       }
     }
 
@@ -227,6 +343,8 @@ export default function BedMap({
       ? bookingsOnBed.map(b => `${b.slot === "full_day" ? "Giornata Intera" : b.slot === "morning" ? "Mattina" : "Pomeriggio"}: ${b.customerName}`).join(" | ")
       : `Lettino ${bedNum}`;
 
+    const isPartial = occupiedCount > 0 && occupiedCount < totalItems;
+
     return (
       <button
         key={key}
@@ -234,6 +352,7 @@ export default function BedMap({
         onClick={() => !isClientView && onBedSelect && onBedSelect(bedNum)}
         disabled={isClientView}
         title={tooltipTitle}
+        style={state !== "free" ? style : undefined}
         className={`border rounded-md md:rounded-lg flex flex-col items-center justify-between relative transition-all duration-150 ${btnSizeClass} ${bgClass} ${textClass} ${selectedClass}`}
       >
         {/* Top section: Bed Number */}
@@ -243,6 +362,13 @@ export default function BedMap({
           {/* Small badge for subscriber */}
           {!isClientView && isSubscriber && state !== "free" && (
             <span className="absolute top-0 right-0.5 w-1 h-1 sm:w-1.5 sm:h-1.5 rounded-full bg-[#8A6D3B] shrink-0" title="Abbonato" />
+          )}
+
+          {/* Partial Occupancy Badge */}
+          {isPartial && (
+            <span className="absolute top-0 left-0.5 bg-slate-900 text-white font-black text-[8px] sm:text-[9px] px-1 py-0.5 rounded-full shrink-0 shadow-sm leading-none" title={`Sotto-risorse occupate: ${occupiedCount}/${totalItems}`}>
+              {occupiedCount}/{totalItems}
+            </span>
           )}
         </div>
 
@@ -339,24 +465,32 @@ export default function BedMap({
       ) : (
         <div id="map-legend" className="flex flex-wrap gap-4 items-center justify-center p-3 bg-[#FDFBF7] rounded-xl border border-[#EFECE6] text-xs text-slate-600 shadow-sm shadow-[#F3EFE6]">
           <div className="flex items-center gap-1.5">
-            <div className="w-4 h-4 bg-[#EAF4F6] border border-[#B3D5DC] rounded"></div>
+            <div className="w-4 h-4 border border-slate-300 rounded animate-none" style={{ backgroundColor: BOOKING_TYPE_COLORS.free }}></div>
             <span>Libero</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <div className="w-4 h-4 bg-[#D5EAEF] border border-[#99CCD6] rounded"></div>
-            <span>Giornaliero Intero</span>
+            <div className="w-4 h-4 border border-slate-300 rounded" style={{ backgroundColor: BOOKING_TYPE_COLORS.mattina }}></div>
+            <span>Mattina (AM)</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <div className="w-4 h-4 bg-[#F9F1E2] border border-[#E2D1B3] rounded"></div>
+            <div className="w-4 h-4 border border-slate-300 rounded" style={{ backgroundColor: BOOKING_TYPE_COLORS.pomeriggio }}></div>
+            <span>Pomeriggio (PM)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 border border-slate-300 rounded" style={{ backgroundColor: BOOKING_TYPE_COLORS.intera }}></div>
+            <span>Giornata Intera (Full)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 border border-slate-300 rounded" style={{ backgroundColor: BOOKING_TYPE_COLORS.abbonato }}></div>
             <span>Abbonato</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <div className="w-4 h-4 bg-gradient-to-b from-[#D5EAEF] to-white border border-[#99CCD6] rounded"></div>
-            <span>Occupato Mattina (AM)</span>
+            <div className="w-4 h-4 border border-slate-300 rounded" style={{ background: `linear-gradient(135deg, ${BOOKING_TYPE_COLORS.mattina} 50%, ${BOOKING_TYPE_COLORS.pomeriggio} 50%)` }}></div>
+            <span>AM + PM (Split)</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <div className="w-4 h-4 bg-gradient-to-t from-[#D5EAEF] to-white border border-[#99CCD6] rounded"></div>
-            <span>Occupato Pomeriggio (PM)</span>
+            <div className="w-8 h-4 bg-slate-900 text-white text-[8px] font-black rounded flex items-center justify-center shadow-sm">1/3</div>
+            <span>Parzialmente Occupato</span>
           </div>
           <div className="flex items-center gap-1.5">
             <div className="w-2 h-2 rounded-full bg-emerald-500"></div>

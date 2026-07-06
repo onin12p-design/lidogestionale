@@ -88,6 +88,15 @@
           "enum": ["morning", "afternoon", "full_day"],
           "description": "Timeslot"
         },
+        "tipoPrenotazione": {
+          "type": "string",
+          "enum": ["mattina", "pomeriggio", "intera", "abbonato"],
+          "description": "Visual color type of booking"
+        },
+        "risorse": {
+          "type": "array",
+          "description": "Items occupied per postazione"
+        },
         "customerId": {
           "type": "string",
           "description": "Customer ID reference"
@@ -241,6 +250,10 @@
     "/tabs/{tabId}": {
       "schema": "Tab",
       "description": "Food/drink tabs associated with bed bookings"
+    },
+    "/settings/{settingId}": {
+      "schema": "object",
+      "description": "App settings (like beds configuration)"
     }
   }
 }

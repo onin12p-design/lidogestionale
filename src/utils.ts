@@ -107,7 +107,11 @@ export function sanitizeForFirestore<T>(obj: T): T {
 /**
  * Determines the row (1-5) for a given bed number based on the beach club rows.
  */
-export function getBedRow(bedNum: number): number {
+export function getBedRow(bedNum: number, rowsConfig?: Record<number, number>): number {
+  if (rowsConfig) {
+    const val = rowsConfig[bedNum];
+    if (val !== undefined) return Number(val);
+  }
   const row1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70];
   const row2 = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81];
   const row3 = [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92];
@@ -130,9 +134,10 @@ export function getPriceForBooking(
   dateStr: string,
   bedNumber: number,
   slot: "morning" | "afternoon" | "full_day",
-  pricingConfigs: any[]
+  pricingConfigs: any[],
+  rowsConfig?: Record<number, number>
 ): number {
-  const row = getBedRow(bedNumber);
+  const row = getBedRow(bedNumber, rowsConfig);
   if (!dateStr) return slot === "full_day" ? 30 : 15;
   
   // Extract month from date YYYY-MM-DD
@@ -192,5 +197,107 @@ export function getPriceForBooking(
   const rowPrice = defaultMonth[row] || defaultMonth[1];
   return slot === "full_day" ? rowPrice.fullDay : rowPrice.halfDay;
 }
+
+/**
+ * Returns the count of lettini for a given bed, based on the custom configuration or default.
+ */
+export function getBedLettiniCount(bedNum: number, bedsConfig?: Record<number, number>): number {
+  if (bedsConfig && bedsConfig[bedNum] !== undefined) {
+    return bedsConfig[bedNum];
+  }
+  return 2; // Default
+}
+
+/**
+ * Returns the list of available items (ombrellone, lettino_1, lettino_2, etc.) for a bed.
+ */
+export function getBedItems(bedNum: number, numLettini: number): string[] {
+  const items = ["ombrellone"];
+  for (let i = 1; i <= numLettini; i++) {
+    items.push(`lettino_${i}`);
+  }
+  return items;
+}
+
+/**
+ * Calculates the booking price proportionally based on the booked sub-resources.
+ */
+export function getBookingPriceProportional(
+  booking: any,
+  pricingConfigs: any[],
+  bedsConfig?: Record<number, number>,
+  rowsConfig?: Record<number, number>
+): number {
+  if (!booking) return 0;
+
+  const risorseList = booking.risorse && booking.risorse.length > 0
+    ? booking.risorse
+    : [{ postazione: booking.bedNumber, items: [] }];
+
+  let totalPrice = 0;
+
+  risorseList.forEach((res: any) => {
+    const bedNum = res.postazione;
+    const row = getBedRow(bedNum, rowsConfig);
+    const slot = booking.slot;
+
+    // Determine price per single lettino based on row and slot
+    let fullDayLettinoPrice = row === 1 ? 20 : 15;
+    let halfDayLettinoPrice = row === 1 ? 15 : 12;
+
+    // Check custom configs for this month and row if they exist
+    if (booking.date) {
+      const parts = booking.date.split("-");
+      if (parts.length >= 2) {
+        const month = parts[1];
+        const customConfig = pricingConfigs?.find((c) => c.id === month);
+        if (customConfig && customConfig.prices && customConfig.prices[row]) {
+          const rowPrice = customConfig.prices[row];
+          const fullDayTotal = Number(rowPrice.fullDay) ?? 30;
+          const halfDayTotal = Number(rowPrice.halfDay) ?? 15;
+          const numLettini = getBedLettiniCount(bedNum, bedsConfig);
+
+          // Proportional single-lettino price if custom configs exist
+          fullDayLettinoPrice = numLettini > 0 ? (fullDayTotal / numLettini) : 15;
+          halfDayLettinoPrice = numLettini > 0 ? (halfDayTotal / numLettini) : 12;
+        }
+      }
+    }
+
+    const pricePerLettino = slot === "full_day" ? fullDayLettinoPrice : halfDayLettinoPrice;
+
+    // Count how many items in this resource are lettini (start with "lettino_")
+    let bookedLettiniCount = 0;
+    if (res.items && res.items.length > 0) {
+      bookedLettiniCount = res.items.filter((it: string) => it.startsWith("lettino")).length;
+    } else {
+      // Legacy booking fallback: occupies all lettini of this postazione
+      bookedLettiniCount = getBedLettiniCount(bedNum, bedsConfig);
+    }
+
+    totalPrice += bookedLettiniCount * pricePerLettino;
+  });
+
+  return Math.round(totalPrice * 100) / 100; // Round to 2 decimal places
+}
+
+/**
+ * Central conflict checker based on CR-3.
+ * Two bookings on the same day and same postazione and same item conflict if their slots overlap.
+ */
+export function hasConflict(
+  itemBookings: Array<{ slot: "morning" | "afternoon" | "full_day"; tipoPrenotazione?: string }>,
+  nuovaFascia: "morning" | "afternoon" | "full_day"
+): boolean {
+  return itemBookings.some((b) => {
+    const slotA = b.tipoPrenotazione === "abbonato" ? "full_day" : b.slot;
+    const slotB = nuovaFascia;
+    if (slotA === "full_day" || slotB === "full_day") {
+      return true;
+    }
+    return slotA === slotB;
+  });
+}
+
 
 

@@ -190,22 +190,12 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
             }
           }
 
-          // 1. Create customer document
-          const custId = `cust_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-          const customerRef = doc(collection(db, "customers"), custId);
-          
-          await setDoc(customerRef, sanitizeForFirestore({
-            name: item.customerName,
-            type: item.customerType,
-            notes: item.notes || ""
-          }));
-
-          // 2. Create the booking document via transaction
+          // Create the booking document via transaction without creating a customer document
           const bookingData = sanitizeForFirestore({
             bedNumber: item.bedNumber,
             date: currentDate,
             slot: item.slot,
-            customerId: custId,
+            customerId: "", // Scanner bookings have no associated customer card
             customerName: item.customerName,
             customerType: item.customerType,
             source: "scanner" as const,

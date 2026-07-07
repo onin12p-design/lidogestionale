@@ -211,6 +211,14 @@ export default function BedMap({
       stateLabel = "free";
     }
 
+    const isUnconfirmedPayPerDay = bedBookings.some(b => (b as any).dealType === "pay_per_day" && (b as any).isConfirmedPayPerDay === false);
+    if (isUnconfirmedPayPerDay) {
+      style = {
+        background: "repeating-linear-gradient(45deg, #f0ebff 0 8px, #ffffff 8px 16px)"
+      };
+      stateLabel = "unconfirmed_b";
+    }
+
     if (occupiedCount > 0 && occupiedCount < totalItems) {
       const baseBg = style.background || style.backgroundColor || BOOKING_TYPE_COLORS.free;
       style = {
@@ -426,17 +434,27 @@ export default function BedMap({
         {!isClientView ? (
           <div className="w-full flex gap-1 items-center justify-center pb-0.5 h-3 sm:h-4 px-0.5 pointer-events-none">
             {state !== "free" && (
-              <span
-                id={`payment-dot-${bedNum}`}
-                className={`w-1 sm:w-1.5 h-1 sm:h-1.5 rounded-full shrink-0 ${
-                  payment === "paid" 
-                    ? "bg-emerald-500" 
-                    : payment === "deposit" 
-                    ? "bg-amber-400" 
-                    : "bg-rose-500"
-                }`}
-                title={payment === "paid" ? "Saldato" : payment === "deposit" ? "Acconto" : "Non pagato"}
-              />
+              bookingsOnBed.some((b) => b.isHotel) ? (
+                <span
+                  id={`hotel-badge-${bedNum}`}
+                  className="px-1 bg-sky-100 text-sky-700 font-extrabold text-[8px] sm:text-[9px] rounded border border-sky-300 leading-none h-3 flex items-center justify-center shrink-0"
+                  title="Hotel (Non da saldare)"
+                >
+                  H
+                </span>
+              ) : (
+                <span
+                  id={`payment-dot-${bedNum}`}
+                  className={`w-1 sm:w-1.5 h-1 sm:h-1.5 rounded-full shrink-0 ${
+                    payment === "paid" 
+                      ? "bg-emerald-500" 
+                      : payment === "deposit" 
+                      ? "bg-amber-400" 
+                      : "bg-rose-500"
+                  }`}
+                  title={payment === "paid" ? "Saldato" : payment === "deposit" ? "Acconto" : "Non pagato"}
+                />
+              )
             )}
 
             {hasOpenTab && (
@@ -514,6 +532,10 @@ export default function BedMap({
           <div className="flex items-center gap-1.5">
             <div className="w-2 h-2 rounded-full bg-rose-500"></div>
             <span>Non Pagato</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="px-1 bg-sky-100 text-sky-700 font-extrabold text-[8px] rounded border border-sky-300">H</span>
+            <span>Hotel (Convenzionato)</span>
           </div>
           <div className="flex items-center gap-1.5">
             <Coffee className="w-3.5 h-3.5 text-amber-600" />

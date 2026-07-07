@@ -3,7 +3,7 @@ import { signInAnonymously } from "firebase/auth";
 import { collection, query, where, onSnapshot, doc, setDoc } from "firebase/firestore";
 import { auth, db } from "./lib/firebase";
 import { getRomeTodayString, formatItalianDate } from "./utils";
-import { Booking, Tab, Payment, Subscription } from "./types";
+import { Booking, Tab, Payment, Subscription, Customer, LedgerEntry, Attendance } from "./types";
 
 // Import modules
 import DailyMapModule from "./components/DailyMapModule";
@@ -44,9 +44,14 @@ export default function App() {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [ledger, setLedger] = useState<LedgerEntry[]>([]);
+  const [attendance, setAttendance] = useState<Attendance[]>([]);
   const [pricingConfigs, setPricingConfigs] = useState<any[]>([]);
   const [bedsConfig, setBedsConfig] = useState<Record<number, number>>({});
   const [rowsConfig, setRowsConfig] = useState<Record<number, number>>({});
+  const [subscriptionSetup, setSubscriptionSetup] = useState<{ periods: any[], slotTypes: any[] }>({ periods: [], slotTypes: [] });
+  const [priceList, setPriceList] = useState<{ entries: any[] }>({ entries: [] });
   const [loadingData, setLoadingData] = useState(true);
 
   // Popstate location change listener
@@ -162,11 +167,8 @@ export default function App() {
       updateCombinedPayments();
     }, (err) => console.error("Legacy payments sync error:", err));
 
-    // Subscriptions: filter status == 'active' for the main view (A3)
-    const subscriptionsQuery = query(
-      collection(db, "subscriptions"),
-      where("status", "==", "active")
-    );
+    // Subscriptions: load all subscriptions to support historic view
+    const subscriptionsQuery = collection(db, "subscriptions");
     const unsubscribeSubscriptions = onSnapshot(subscriptionsQuery, (snapshot) => {
       const list: Subscription[] = [];
       snapshot.forEach((doc) => {
@@ -178,6 +180,36 @@ export default function App() {
       console.error("Subscriptions sync error:", err);
       setLoadingData(false);
     });
+
+    // Customers collection
+    const customersQuery = collection(db, "customers");
+    const unsubscribeCustomers = onSnapshot(customersQuery, (snapshot) => {
+      const list: Customer[] = [];
+      snapshot.forEach((doc) => {
+        list.push({ id: doc.id, ...doc.data() } as Customer);
+      });
+      setCustomers(list);
+    }, (err) => console.error("Customers sync error:", err));
+
+    // Ledger collection
+    const ledgerQuery = collection(db, "ledger");
+    const unsubscribeLedger = onSnapshot(ledgerQuery, (snapshot) => {
+      const list: LedgerEntry[] = [];
+      snapshot.forEach((doc) => {
+        list.push({ id: doc.id, ...doc.data() } as LedgerEntry);
+      });
+      setLedger(list);
+    }, (err) => console.error("Ledger sync error:", err));
+
+    // Attendance collection
+    const attendanceQuery = collection(db, "attendance");
+    const unsubscribeAttendance = onSnapshot(attendanceQuery, (snapshot) => {
+      const list: Attendance[] = [];
+      snapshot.forEach((doc) => {
+        list.push({ id: doc.id, ...doc.data() } as Attendance);
+      });
+      setAttendance(list);
+    }, (err) => console.error("Attendance sync error:", err));
 
     // Pricing configurations
     const pricingQuery = collection(db, "pricing");
@@ -228,15 +260,69 @@ export default function App() {
       }
     }, (err) => console.error("Rows settings sync error:", err));
 
+    // Subscription Setup configuration
+    const subscriptionSetupRef = doc(db, "config", "subscriptionSetup");
+    const unsubscribeSubscriptionSetup = onSnapshot(subscriptionSetupRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setSubscriptionSetup({
+          periods: data.periods || [],
+          slotTypes: data.slotTypes || []
+        });
+      } else {
+        const defaultSetup = {
+          periods: [
+            { id: "stagionale", label: "Stagionale", dateStart: "2026-06-01", dateEnd: "2026-09-15", active: true },
+            { id: "giugno-luglio", label: "Giugno + Luglio", dateStart: "2026-06-01", dateEnd: "2026-07-31", active: true }
+          ],
+          slotTypes: [
+            { id: "1lig", code: "1LIG", label: "1 Lettino Intera Giornata", active: true },
+            { id: "2lig", code: "2LIG", label: "2 Lettini Intera Giornata", active: true }
+          ]
+        };
+        setDoc(subscriptionSetupRef, defaultSetup)
+          .then(() => console.log("Initialized subscriptionSetup config on Firestore."))
+          .catch(err => console.error("Error initializing subscriptionSetup config:", err));
+      }
+    }, (err) => console.error("subscriptionSetup sync error:", err));
+
+    // Price List configuration
+    const priceListRef = doc(db, "config", "priceList");
+    const unsubscribePriceList = onSnapshot(priceListRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setPriceList({
+          entries: data.entries || []
+        });
+      } else {
+        const defaultPriceList = {
+          entries: [
+            { periodId: "stagionale", slotTypeId: "2lig", price: 1200 },
+            { periodId: "stagionale", slotTypeId: "1lig", price: 750 },
+            { periodId: "giugno-luglio", slotTypeId: "2lig", price: 800 },
+            { periodId: "giugno-luglio", slotTypeId: "1lig", price: 500 }
+          ]
+        };
+        setDoc(priceListRef, defaultPriceList)
+          .then(() => console.log("Initialized priceList config on Firestore."))
+          .catch(err => console.error("Error initializing priceList config:", err));
+      }
+    }, (err) => console.error("priceList sync error:", err));
+
     return () => {
       unsubscribeBookings();
       unsubscribeTabs();
       unsubscribePaymentsMain();
       unsubscribePaymentsLegacy();
       unsubscribeSubscriptions();
+      unsubscribeCustomers();
+      unsubscribeLedger();
+      unsubscribeAttendance();
       unsubscribePricing();
       unsubscribeBeds();
       unsubscribeRows();
+      unsubscribeSubscriptionSetup();
+      unsubscribePriceList();
     };
   }, [isAuth, currentDate]);
 
@@ -581,6 +667,14 @@ export default function App() {
             subscriptions={subscriptions}
             bookings={bookings}
             payments={payments}
+            customers={customers}
+            ledger={ledger}
+            attendance={attendance}
+            bedsConfig={bedsConfig}
+            rowsConfig={rowsConfig}
+            pricingConfigs={pricingConfigs}
+            subscriptionSetup={subscriptionSetup}
+            priceList={priceList}
             onRefresh={() => {}} // real-time sync, no-op (A5)
             preSelectedSubId={preSelectedSubId}
             onClearPreSelectedSubId={() => setPreSelectedSubId(null)}

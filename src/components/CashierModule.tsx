@@ -39,12 +39,15 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
     const bPayments = payments.filter((p) => p.bookingId === booking.id);
     const paidSum = bPayments.reduce((sum, p) => sum + p.amount, 0);
 
-    let expectedPrice = getBookingPriceProportional(booking, pricingConfigs, bedsConfig, rowsConfig);
+    let expectedPrice = booking.isHotel
+      ? (paidSum > 0 ? paidSum : 0)
+      : getBookingPriceProportional(booking, pricingConfigs, bedsConfig, rowsConfig);
     expectedPrice = Math.max(0, expectedPrice - ((booking as any).sconto || 0));
-    const balance = expectedPrice - paidSum;
+    const balance = booking.isHotel ? 0 : (expectedPrice - paidSum);
 
-    let payStatus: "paid" | "partial" | "unpaid" = "unpaid";
-    if (paidSum >= expectedPrice) payStatus = "paid";
+    let payStatus: "paid" | "partial" | "unpaid" | "hotel" = "unpaid";
+    if (booking.isHotel) payStatus = "hotel";
+    else if (paidSum >= expectedPrice) payStatus = "paid";
     else if (paidSum > 0) payStatus = "partial";
 
     return { paidSum, expectedPrice, balance, payStatus };
@@ -71,7 +74,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
     // Outstanding balances for today's bookings
     let pendingBeds = 0;
     bookings.forEach((b) => {
-      if (isSubscriptionBooking(b)) return;
+      if (isSubscriptionBooking(b) || b.isHotel) return;
       const { balance } = getBookingFinance(b);
       if (balance > 0) pendingBeds += balance;
     });
@@ -83,13 +86,16 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
       return sum + tabTotal;
     }, 0);
 
+    const hotelBookingsCount = bookings.filter((b) => b.isHotel).length;
+
     return {
       cashTotal,
       cardTotal,
       grandTotal: cashTotal + cardTotal,
       pendingBeds,
       pendingTabs,
-      totalOutstanding: pendingBeds + pendingTabs
+      totalOutstanding: pendingBeds + pendingTabs,
+      hotelBookingsCount
     };
   };
 
@@ -109,7 +115,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
 
     // Pending bookings (unpaid or acconto)
     bookings.forEach((b) => {
-      if (isSubscriptionBooking(b)) return;
+      if (isSubscriptionBooking(b) || b.isHotel) return;
       const { balance, payStatus } = getBookingFinance(b);
       if (balance > 0) {
         list.push({
@@ -323,6 +329,15 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
               <span>{summary.totalOutstanding} €</span>
             </div>
           </div>
+
+          {summary.hotelBookingsCount > 0 && (
+            <div className="bg-sky-50 border border-sky-100 p-4 rounded-xl flex justify-between items-center text-xs text-sky-800">
+              <span className="font-bold uppercase tracking-wide text-[10px] text-sky-600">Hotel:</span>
+              <span className="font-black text-sm text-sky-950">
+                {summary.hotelBookingsCount} {summary.hotelBookingsCount === 1 ? "presenza" : "presenze"}
+              </span>
+            </div>
+          )}
         </div>
 
         <div className="bg-slate-50 rounded-xl p-3 text-[10px] text-slate-400 mt-6 text-center">

@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { signInAnonymously } from "firebase/auth";
-import { collection, query, where, onSnapshot, doc, setDoc } from "firebase/firestore";
-import { auth, db } from "./lib/firebase";
+import { auth, db, collection, query, where, onSnapshot, doc, setDoc, offlineModeState } from "./lib/firebase";
 import { getRomeTodayString, formatItalianDate } from "./utils";
 import { Booking, Tab, Payment, Subscription, Customer, LedgerEntry, Attendance } from "./types";
 
@@ -53,6 +52,15 @@ export default function App() {
   const [subscriptionSetup, setSubscriptionSetup] = useState<{ periods: any[], slotTypes: any[] }>({ periods: [], slotTypes: [] });
   const [priceList, setPriceList] = useState<{ entries: any[] }>({ entries: [] });
   const [loadingData, setLoadingData] = useState(true);
+  const [isOfflineMode, setIsOfflineMode] = useState(offlineModeState.active);
+  const [isQuotaExceeded, setIsQuotaExceeded] = useState(offlineModeState.quotaExceeded);
+
+  useEffect(() => {
+    return offlineModeState.subscribe(() => {
+      setIsOfflineMode(offlineModeState.active);
+      setIsQuotaExceeded(offlineModeState.quotaExceeded);
+    });
+  }, []);
 
   // Popstate location change listener
   useEffect(() => {
@@ -596,6 +604,38 @@ export default function App() {
 
         </div>
       </header>
+
+      {/* Offline Mode / Quota Exceeded Notification Banner */}
+      {isOfflineMode && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-3 text-amber-900">
+          <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+              <span>
+                <strong>{isQuotaExceeded ? "⚠️ Quota di lettura Firebase Cloud esaurita per oggi (Free Tier)." : "🔌 Modalità Offline attiva."}</strong> L'applicazione è passata automaticamente alla <strong>Modalità Locale (salvataggio su questo browser)</strong> per permetterti di continuare a lavorare e testare senza interruzioni!
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {isQuotaExceeded && (
+                <a 
+                  href="https://console.firebase.google.com/project/gen-lang-client-0413763692/firestore/databases/ai-studio-32ba66f9-fa10-4db6-8413-9c47def28b74/data?openUpgradeDialog=true" 
+                  target="_blank" 
+                  rel="noopener noreferrer" 
+                  className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg shadow-sm transition-all"
+                >
+                  Gestisci Quota / Upgrade ↗
+                </a>
+              )}
+              <button 
+                onClick={() => offlineModeState.setOffline(false)} 
+                className="px-3 py-1 bg-slate-200 hover:bg-slate-300 text-slate-800 font-bold rounded-lg transition-all"
+              >
+                Riconnetti Cloud
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 2. SUB HEADER TAB MENU */}
       <div id="app-tab-navigation" className="bg-white border-b border-[#EFECE6] px-4 shadow-sm py-2 sticky top-14 md:top-16 z-30">

@@ -1,13 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { 
-  collection, 
-  doc, 
-  setDoc, 
-  deleteDoc, 
-  addDoc, 
-  writeBatch 
-} from "firebase/firestore";
-import { db, createBookingTransactional } from "../lib/firebase";
+import { db, createBookingTransactional, collection, doc, setDoc, deleteDoc, addDoc, writeBatch } from "../lib/firebase";
 import { 
   getRomeTodayString, 
   formatItalianDate, 

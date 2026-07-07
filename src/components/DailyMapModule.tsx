@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { Booking, Tab, Payment, BookingSlot, CustomerType, PaymentMethod, PaymentKind, BookingTipoPrenotazione } from "../types";
-import { getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "firebase/firestore";
-import { db, handleFirestoreError, OperationType, createBookingTransactional } from "../lib/firebase";
+import { db, handleFirestoreError, OperationType, createBookingTransactional, getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "../lib/firebase";
 import { getRomeTodayString, adjustDateString, formatItalianDate, isValidBedNumber, sanitizeForFirestore, getPriceForBooking, getBookingPriceProportional, getBedLettiniCount, getBedItems, hasConflict } from "../utils";
 import BedMap, { PEDANA_SINISTRA_LEFT, PEDANA_SINISTRA_RIGHT, PEDANA_DESTRA_LEFT, PEDANA_DESTRA_RIGHT } from "./BedMap";
 import { Calendar, ChevronLeft, ChevronRight, Search, Plus, Trash2, CreditCard, Coffee, Check, AlertCircle, Info, Users, Save, Clock, Printer, X, Maximize2, Minimize2, ExternalLink } from "lucide-react";

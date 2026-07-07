@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { Booking, Customer, BookingSlot, CustomerType } from "../types";
-import { getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "firebase/firestore";
-import { db, handleFirestoreError, OperationType, createBookingTransactional } from "../lib/firebase";
+import { db, handleFirestoreError, OperationType, createBookingTransactional, getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "../lib/firebase";
 import { isValidBedNumber, sanitizeForFirestore } from "../utils";
 import { Upload, AlertTriangle, Check, Trash2, Plus, Sparkles, Loader2 } from "lucide-react";
 

@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { doc, setDoc } from "firebase/firestore";
-import { db } from "../lib/firebase";
+import { db, doc, setDoc } from "../lib/firebase";
 import { sanitizeForFirestore } from "../utils";
 import { Save, RefreshCw, CheckCircle, Info, Calendar, DollarSign, Layers } from "lucide-react";
 import { motion } from "motion/react";

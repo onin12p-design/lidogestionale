@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { Booking, Tab, Payment, PaymentMethod, PaymentKind, TabItem } from "../types";
-import { getFirestore, setDoc, doc, collection, addDoc, getDocs, writeBatch, serverTimestamp } from "firebase/firestore";
-import { db, handleFirestoreError, OperationType } from "../lib/firebase";
+import { db, handleFirestoreError, OperationType, getFirestore, setDoc, doc, collection, addDoc, getDocs, writeBatch, serverTimestamp } from "../lib/firebase";
 import { sanitizeForFirestore, getPriceForBooking, getBookingPriceProportional } from "../utils";
 import { Coffee, CreditCard, Euro, CheckCircle, Search, Clock, AlertTriangle, Plus, Trash } from "lucide-react";
 

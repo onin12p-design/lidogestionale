@@ -462,6 +462,8 @@ export function writeBatch(databaseInstance: any) {
           console.warn("Real writeBatch commit failed:", err);
           if (err.message?.includes("Quota exceeded") || err.code === "resource-exhausted" || err.message?.includes("Quota limit exceeded")) {
             offlineModeState.setOffline(true, true);
+          } else {
+            throw err;
           }
         }
       }
@@ -618,9 +620,11 @@ export async function runTransaction(dbInstance: any, updateFunction: (transacti
       });
       return realResult;
     } catch (err: any) {
-      console.warn("Real transaction failed, running in local fallback:", err);
+      console.warn("Real transaction failed:", err);
       if (err.message?.includes("Quota exceeded") || err.code === "resource-exhausted" || err.message?.includes("Quota limit exceeded")) {
         offlineModeState.setOffline(true, true);
+      } else {
+        throw err;
       }
     }
   }

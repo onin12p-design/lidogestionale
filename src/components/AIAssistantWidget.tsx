@@ -255,6 +255,13 @@ export default function AIAssistantWidget() {
   );
 }
 
+const slugify = (text: string) => {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)+/g, "");
+};
+
 /* ==========================================
    PROPOSAL CARDS COMPONENT
    ========================================== */
@@ -278,6 +285,10 @@ function ProposalCard({ proposal }: { proposal: any; key?: any }) {
 
   // 1. CONFIRM SUBSCRIPTION PROPOSAL
   const confirmSubscription = async () => {
+    if (!formData.periods || formData.periods.length === 0) {
+      setStatusText("Periodo mancante — impossibile salvare, richiedi una nuova proposta o inserisci il periodo manualmente");
+      return;
+    }
     setSubmitting(true);
     setStatusText(null);
 
@@ -305,10 +316,11 @@ function ProposalCard({ proposal }: { proposal: any; key?: any }) {
         }
 
         // Step B: Set the Subscription
-        const subId = `sub_${Date.now()}`;
+        const firstPeriod = formData.periods[0];
+        const sortedBeds = formData.bedNumbers ? [...formData.bedNumbers].sort((a: any, b: any) => Number(a) - Number(b)).join("-") : "";
+        const subId = `sub_${slugify(formData.customerName)}_${sortedBeds}_${firstPeriod.startDate}`;
         const subDocRef = doc(db, "subscriptions", subId);
         
-        const firstPeriod = formData.periods?.[0] || { startDate: "2026-06-01", endDate: "2026-09-15" };
         const price = Number(formData.priceTotal) || 0;
 
         tx.set(subDocRef, {
@@ -324,7 +336,7 @@ function ProposalCard({ proposal }: { proposal: any; key?: any }) {
         });
 
         // Step C: Generate Bookings inside transaction (CRITICAL WRITE REQUIREMENT)
-        for (const period of formData.periods || []) {
+        for (const period of formData.periods) {
           const start = new Date(period.startDate);
           const end = new Date(period.endDate);
           
@@ -513,7 +525,7 @@ function ProposalCard({ proposal }: { proposal: any; key?: any }) {
       {!isConfirmed ? (
         <button
           onClick={proposal.type === "subscription" ? confirmSubscription : confirmDailyMap}
-          disabled={submitting}
+          disabled={submitting || (proposal.type === "subscription" && (!formData.periods || formData.periods.length === 0))}
           className="w-full py-2.5 bg-[#025A70] hover:bg-[#014152] disabled:bg-slate-300 text-white font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
         >
           {submitting ? (
@@ -528,6 +540,12 @@ function ProposalCard({ proposal }: { proposal: any; key?: any }) {
           <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
           <span>Inserito con successo via Transazione!</span>
         </div>
+      )}
+
+      {proposal.type === "subscription" && (!formData.periods || formData.periods.length === 0) && (
+        <p className="text-[10px] text-center font-semibold text-rose-700">
+          Periodo mancante — impossibile salvare, richiedi una nuova proposta o inserisci il periodo manualmente
+        </p>
       )}
 
       {statusText && (

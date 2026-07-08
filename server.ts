@@ -149,7 +149,13 @@ app.get("/api/health", (req, res) => {
 // POST staff login endpoint checking environment variable
 app.post("/api/staff-login", (req, res) => {
   const { password } = req.body;
-  const staffPassword = process.env.SECRET_STAFF_PASSWORD || "samarinda2026";
+  const staffPassword = process.env.SECRET_STAFF_PASSWORD;
+  if (!staffPassword || staffPassword.trim() === "") {
+    return res.status(500).json({ 
+      success: false, 
+      error: "Configurazione di sicurezza mancante. Contattare l'amministratore." 
+    });
+  }
   if (password === staffPassword) {
     res.json({ success: true });
   } else {
@@ -517,11 +523,8 @@ async function parseDocxDeterministic(buffer: Buffer, originalName: string) {
     const daConfermareP = pomeriggioNameRaw.toLowerCase().includes("da confermare");
 
     const cleanCustomerName = (rawName: string): string => {
-      let name = rawName.replace(/da confermare/gi, "").replace(/\s+/g, " ").trim();
-      if (!name || /^[.\-\s_]+$/.test(name)) {
-        return "Cliente";
-      }
-      return name;
+      let name = rawName.replace(/\s+/g, " ").trim();
+      return name || "Cliente";
     };
 
     const buildNotes = (baseMarcature: string, isDaConfermare: boolean): string => {
@@ -829,16 +832,28 @@ function extractMetadata(filePath: string): { platform: "sx" | "dx", date: strin
 // Helper to identify ambiguous customer names
 function isAmbiguousName(rawName: string): boolean {
   if (!rawName) return true;
-  const upper = rawName.toUpperCase();
-  if (upper.includes("?")) return true;
-  // If the name is long, uppercase, and has no space/punctuation (e.g. concatenated names like PENSABONOMI)
-  if (upper.length > 8 && !upper.includes(" ") && !upper.includes("-") && !upper.includes(".")) {
+  const upper = rawName.toUpperCase().trim();
+  if (
+    upper === "" || 
+    upper === "?" || 
+    upper === "N/D" || 
+    upper === "ND" || 
+    upper === "SCONOSCIUTO" || 
+    upper === "CLIENTE" || 
+    upper === "DA DEFINIRE" || 
+    upper === "LIBERO" || 
+    upper === "VUOTO"
+  ) {
     return true;
   }
-  // Check for non-alphabetic chars (excluding space, dots, apostrophe, dash)
-  if (/[^a-zA-Z\s.\-']/.test(rawName)) {
+  
+  // If there's at least one alphabetical letter character (including accented Italian chars like àèéìòù), it's a valid candidate.
+  // We check if it has at least 2 alphanumeric characters or is not a series of purely symbols.
+  const letters = upper.replace(/[^A-ZÀÈÉÌÒÙ]/g, "");
+  if (letters.length < 2) {
     return true;
   }
+  
   return false;
 }
 

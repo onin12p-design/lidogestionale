@@ -224,6 +224,65 @@
         }
       },
       "required": ["monthId", "monthName", "prices"]
+    },
+    "DailyPresence": {
+      "title": "DailyPresence",
+      "description": "Represents parsed structured daily presence from historic documents",
+      "type": "object",
+      "properties": {
+        "platform": {
+          "type": "string",
+          "enum": ["sx", "dx"]
+        },
+        "bedNumber": {
+          "type": "integer"
+        },
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "slot": {
+          "type": "string",
+          "enum": ["morning", "afternoon", "both"]
+        },
+        "rawName": {
+          "type": "string"
+        },
+        "parseConfidence": {
+          "type": "string",
+          "enum": ["clean", "ambiguous"]
+        },
+        "sourceStoragePath": {
+          "type": "string"
+        },
+        "importedAt": {
+          "type": "string"
+        }
+      },
+      "required": ["platform", "bedNumber", "date", "slot", "rawName", "parseConfidence"]
+    },
+    "SourceDocument": {
+      "title": "SourceDocument",
+      "description": "Represents a source file uploaded to the archive",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer"
+        },
+        "downloadUrl": {
+          "type": "string"
+        },
+        "uploadedAt": {
+          "type": "string"
+        }
+      },
+      "required": ["path", "name", "downloadUrl", "uploadedAt"]
     }
   },
   "firestore": {
@@ -254,6 +313,14 @@
     "/settings/{settingId}": {
       "schema": "object",
       "description": "App settings (like beds configuration)"
+    },
+    "/dailyPresences/{presenceId}": {
+      "schema": "DailyPresence",
+      "description": "Daily structured historical presences"
+    },
+    "/sourceDocuments/{docId}": {
+      "schema": "SourceDocument",
+      "description": "Archived source files"
     }
   }
 }

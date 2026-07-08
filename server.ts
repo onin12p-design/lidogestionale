@@ -9,9 +9,13 @@ import mammoth from "mammoth";
 
 // Firebase web imports for server-side API proxying
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, getDocs, query, where, doc, getDoc } from "firebase/firestore";
+import { getFirestore, collection, getDocs, query, where, doc, getDoc, setDoc, addDoc } from "firebase/firestore";
 import { getAuth, signInAnonymously } from "firebase/auth";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import fs from "fs";
+import { promises as fsPromises } from "fs";
 import firebaseConfig from "./firebase-applet-config.json";
+
 
 dotenv.config();
 
@@ -22,6 +26,8 @@ const PORT = 3000;
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 const auth = getAuth(firebaseApp);
+const storage = getStorage(firebaseApp);
+
 
 let isServerAuth = false;
 let serverAuthError: any = null;
@@ -766,6 +772,649 @@ Restituisci solo un array di oggetti validi secondo la risposta strutturata JSON
   } catch (error: any) {
     console.error("Errore generale nell'endpoint /api/parse-scanner:", error);
     res.status(500).json({ error: error.message || "Errore durante l'elaborazione dei documenti con Gemini." });
+  }
+});
+
+// ==========================================
+// NEW FEATURE: INGESTION AND AI ASSISTANT
+// ==========================================
+
+// Helper to extract platform and date from file path/name
+function extractMetadata(filePath: string): { platform: "sx" | "dx", date: string } {
+  const lowerPath = filePath.toLowerCase();
+  
+  // Platform extraction
+  let platform: "sx" | "dx" = "sx";
+  if (lowerPath.includes("dx") || lowerPath.includes("destra")) {
+    platform = "dx";
+  } else if (lowerPath.includes("sx") || lowerPath.includes("sinistra")) {
+    platform = "sx";
+  }
+
+  // Date extraction
+  let dateStr = "2026-07-01"; // Fallback to July 1st as starting point
+  
+  // Try YYYY-MM-DD
+  const ymdMatch = filePath.match(/(\d{4})[-_](\d{2})[-_](\d{2})/);
+  if (ymdMatch) {
+    dateStr = `${ymdMatch[1]}-${ymdMatch[2]}-${ymdMatch[3]}`;
+    return { platform, date: dateStr };
+  }
+  
+  // Try DD-MM-YYYY
+  const dmyMatch = filePath.match(/(\d{2})[-_](\d{2})[-_](\d{4})/);
+  if (dmyMatch) {
+    dateStr = `${dmyMatch[3]}-${dmyMatch[2]}-${dmyMatch[1]}`;
+    return { platform, date: dateStr };
+  }
+
+  // Fallback Month detection from Italian name
+  let month = "07"; // default July
+  if (lowerPath.includes("giugno")) month = "06";
+  else if (lowerPath.includes("luglio")) month = "07";
+  else if (lowerPath.includes("agosto")) month = "08";
+  else if (lowerPath.includes("settembre")) month = "09";
+
+  // Day extraction: look for (1), Copia (1) or a standalone number
+  let day = "01";
+  const numMatch = filePath.match(/\((\d+)\)/) || filePath.match(/[-_ ](\d+)/) || filePath.match(/(\d+)\./);
+  if (numMatch) {
+    day = numMatch[1].padStart(2, "0");
+  }
+
+  dateStr = `2026-${month}-${day}`;
+  return { platform, date: dateStr };
+}
+
+// Helper to identify ambiguous customer names
+function isAmbiguousName(rawName: string): boolean {
+  if (!rawName) return true;
+  const upper = rawName.toUpperCase();
+  if (upper.includes("?")) return true;
+  // If the name is long, uppercase, and has no space/punctuation (e.g. concatenated names like PENSABONOMI)
+  if (upper.length > 8 && !upper.includes(" ") && !upper.includes("-") && !upper.includes(".")) {
+    return true;
+  }
+  // Check for non-alphabetic chars (excluding space, dots, apostrophe, dash)
+  if (/[^a-zA-Z\s.\-']/.test(rawName)) {
+    return true;
+  }
+  return false;
+}
+
+// Upload endpoint for "Sorgenti"
+app.post("/api/sorgenti/upload", upload.array("files"), async (req, res) => {
+  try {
+    const files = req.files as Express.Multer.File[];
+    const folder = req.body.folder || "dx/luglio"; // target folder path
+
+    if (!files || files.length === 0) {
+      res.status(400).json({ error: "Nessun file fornito per il caricamento." });
+      return;
+    }
+
+    await ensureServerAuth();
+
+    const uploadedFiles: any[] = [];
+    const parseErrors: string[] = [];
+    let dailyPresencesCount = 0;
+
+    for (const file of files) {
+      try {
+        const relativeFolder = folder.replace(/^sorgenti\//, "");
+        const filePath = `sorgenti/${relativeFolder}/${file.originalname}`;
+        
+        // 1. Create directory locally and write file (sandbox/container local persistence fallback)
+        const localFolderDir = path.join(process.cwd(), "assets", "uploaded_sorgenti", relativeFolder);
+        await fsPromises.mkdir(localFolderDir, { recursive: true });
+        const localFilePath = path.join(localFolderDir, file.originalname);
+        await fsPromises.writeFile(localFilePath, file.buffer);
+
+        // 2. Upload to Firebase Storage
+        let downloadUrl = `/api/sorgenti/download?path=${encodeURIComponent(filePath)}`;
+        try {
+          const storageRef = ref(storage, filePath);
+          const uploadResult = await uploadBytes(storageRef, file.buffer);
+          const realUrl = await getDownloadURL(uploadResult.ref);
+          if (realUrl) {
+            downloadUrl = realUrl;
+          }
+        } catch (storageErr: any) {
+          console.warn(`Firebase Storage upload failed, using local server fallback URL:`, storageErr.message || storageErr);
+        }
+
+        // 3. Save File metadata in Firestore 'sourceDocuments'
+        const docId = filePath.replace(/\//g, "_");
+        const fileMetadata = {
+          path: filePath,
+          name: file.originalname,
+          size: file.size,
+          downloadUrl,
+          uploadedAt: new Date().toISOString()
+        };
+        await setDoc(doc(db, "sourceDocuments", docId), fileMetadata);
+
+        // 4. Ingest parsed daily presences if .docx
+        const isDocx = file.originalname.toLowerCase().endsWith(".docx");
+        if (isDocx) {
+          const parsedItems = await parseDocxDeterministic(file.buffer, file.originalname);
+          const { platform, date } = extractMetadata(`${relativeFolder}/${file.originalname}`);
+
+          for (const item of parsedItems) {
+            // Determine correct slot mapping (full_day -> both)
+            const slot = item.slot === "full_day" ? "both" : item.slot;
+            
+            // Build unique deterministic presence ID to prevent duplicate imports
+            const presenceId = `${date}_${platform}_${item.bedNumber}_${slot}`;
+            
+            const presenceData = {
+              platform,
+              bedNumber: item.bedNumber,
+              date,
+              slot,
+              rawName: item.customerName,
+              parseConfidence: isAmbiguousName(item.customerName) ? "ambiguous" : "clean",
+              sourceStoragePath: filePath,
+              importedAt: new Date().toISOString()
+            };
+
+            await setDoc(doc(db, "dailyPresences", presenceId), presenceData);
+            dailyPresencesCount++;
+          }
+        }
+
+        uploadedFiles.push({
+          name: file.originalname,
+          path: filePath,
+          downloadUrl
+        });
+
+      } catch (err: any) {
+        console.error(`Errore nel caricamento del file ${file.originalname}:`, err);
+        parseErrors.push(`File ${file.originalname}: ${err.message || String(err)}`);
+      }
+    }
+
+    res.json({
+      success: true,
+      files: uploadedFiles,
+      dailyPresencesImported: dailyPresencesCount,
+      errors: parseErrors.length > 0 ? parseErrors : null
+    });
+
+  } catch (err: any) {
+    console.error("Errore nell'endpoint /api/sorgenti/upload:", err);
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// List endpoint for "Sorgenti"
+app.get("/api/sorgenti/list", async (req, res) => {
+  try {
+    await ensureServerAuth();
+    const colRef = collection(db, "sourceDocuments");
+    const snap = await getDocs(colRef);
+    const list: any[] = [];
+    snap.forEach((docSnap) => {
+      list.push({ id: docSnap.id, ...docSnap.data() });
+    });
+    res.json({ success: true, files: list });
+  } catch (err: any) {
+    console.error("Error listing source files:", err);
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// Download endpoint for local fallback
+app.get("/api/sorgenti/download", async (req, res) => {
+  try {
+    const { path: filePath } = req.query;
+    if (typeof filePath !== "string") {
+      res.status(400).send("Parametro path mancante.");
+      return;
+    }
+    
+    // Prevent directory traversal
+    const cleanPath = path.normalize(filePath).replace(/^(\.\.(\/|\\|$))+/, "");
+    const relativePart = cleanPath.startsWith("sorgenti/") ? cleanPath.substring(9) : cleanPath;
+    const localFile = path.join(process.cwd(), "assets", "uploaded_sorgenti", relativePart);
+    
+    if (fs.existsSync(localFile)) {
+      res.download(localFile);
+    } else {
+      res.status(404).send("File non trovato localmente.");
+    }
+  } catch (err: any) {
+    console.error("Error downloading file:", err);
+    res.status(500).send("Errore durante il download.");
+  }
+});
+
+// Firestore Query Helpers for AI Assistant Tools
+async function searchDailyPresences(name: string, dateFrom?: string, dateTo?: string, platform?: string) {
+  const colRef = collection(db, "dailyPresences");
+  const snap = await getDocs(colRef);
+  const results: any[] = [];
+  snap.forEach((docSnap) => {
+    const data = docSnap.data();
+    const rawName = String(data.rawName || "").toUpperCase();
+    const searchName = name.toUpperCase();
+    
+    if (rawName.includes(searchName)) {
+      if (dateFrom && data.date < dateFrom) return;
+      if (dateTo && data.date > dateTo) return;
+      if (platform && data.platform !== platform) return;
+      results.push({ id: docSnap.id, ...data });
+    }
+  });
+  return results.slice(0, 100); // Limit to 100 results for safety
+}
+
+async function getBedHistory(bedNumber: number, platform: string, dateFrom: string, dateTo: string) {
+  const colRef = collection(db, "dailyPresences");
+  const snap = await getDocs(colRef);
+  const results: any[] = [];
+  snap.forEach((docSnap) => {
+    const data = docSnap.data();
+    if (
+      Number(data.bedNumber) === Number(bedNumber) &&
+      data.platform === platform &&
+      data.date >= dateFrom &&
+      data.date <= dateTo
+    ) {
+      results.push({ id: docSnap.id, ...data });
+    }
+  });
+  return results;
+}
+
+async function searchSubscriptions(name: string) {
+  const subSnap = await getDocs(collection(db, "subscriptions"));
+  const custSnap = await getDocs(collection(db, "customers"));
+  
+  const custMap: Record<string, string> = {};
+  custSnap.forEach((docSnap) => {
+    custMap[docSnap.id] = docSnap.data().name || "";
+  });
+
+  const results: any[] = [];
+  subSnap.forEach((docSnap) => {
+    const data = docSnap.data();
+    const customerId = data.customerId || "";
+    const customerName = custMap[customerId] || "";
+    if (customerName.toUpperCase().includes(name.toUpperCase())) {
+      results.push({ id: docSnap.id, customerName, ...data });
+    }
+  });
+  return results;
+}
+
+async function searchCustomers(name: string) {
+  const snap = await getDocs(collection(db, "customers"));
+  const results: any[] = [];
+  snap.forEach((docSnap) => {
+    const data = docSnap.data();
+    if (String(data.name || "").toUpperCase().includes(name.toUpperCase())) {
+      results.push({ id: docSnap.id, ...data });
+    }
+  });
+  return results;
+}
+
+async function getSourceDocument(platform: string, date: string) {
+  const snap = await getDocs(collection(db, "sourceDocuments"));
+  let bestDoc: any = null;
+  snap.forEach((docSnap) => {
+    const data = docSnap.data();
+    const lowerPath = String(data.path || "").toLowerCase();
+    if (lowerPath.includes(platform)) {
+      const meta = extractMetadata(data.path);
+      if (meta.date === date && meta.platform === platform) {
+        bestDoc = data;
+      }
+    }
+  });
+  return bestDoc;
+}
+
+async function getOriginalExcel() {
+  const snap = await getDocs(collection(db, "sourceDocuments"));
+  let bestDoc: any = null;
+  snap.forEach((docSnap) => {
+    const data = docSnap.data();
+    const lowerPath = String(data.path || "").toLowerCase();
+    if (lowerPath.includes("excel") || lowerPath.includes("abb25")) {
+      bestDoc = data;
+    }
+  });
+  return bestDoc;
+}
+
+// Gemini AI Assistant function declarations
+const searchDailyPresencesDeclaration = {
+  name: "searchDailyPresences",
+  description: "Cerca per nome o range di date o pedana nelle presenze storiche strutturate (dailyPresences).",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      name: { type: Type.STRING, description: "Nome o parte del nome da cercare (case-insensitive)" },
+      dateFrom: { type: Type.STRING, description: "Data inizio YYYY-MM-DD (opzionale)" },
+      dateTo: { type: Type.STRING, description: "Data fine YYYY-MM-DD (opzionale)" },
+      platform: { type: Type.STRING, description: "Pedana 'sx' o 'dx' (opzionale)" }
+    },
+    required: ["name"]
+  }
+};
+
+const getBedHistoryDeclaration = {
+  name: "getBedHistory",
+  description: "Ritorna lo storico delle presenze registrate su un lettino specifico in un dato periodo.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      bedNumber: { type: Type.INTEGER, description: "Numero del lettino (1-109)" },
+      platform: { type: Type.STRING, description: "Pedana ('sx' o 'dx')" },
+      dateFrom: { type: Type.STRING, description: "Data inizio YYYY-MM-DD" },
+      dateTo: { type: Type.STRING, description: "Data fine YYYY-MM-DD" }
+    },
+    required: ["bedNumber", "platform", "dateFrom", "dateTo"]
+  }
+};
+
+const searchSubscriptionsDeclaration = {
+  name: "searchSubscriptions",
+  description: "Cerca gli abbonamenti stagionali o pluri-mensili attuali per nome cliente.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      name: { type: Type.STRING, description: "Nome del cliente da cercare" }
+    },
+    required: ["name"]
+  }
+};
+
+const searchCustomersDeclaration = {
+  name: "searchCustomers",
+  description: "Cerca i clienti in anagrafica per nome.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      name: { type: Type.STRING, description: "Nome del cliente da cercare" }
+    },
+    required: ["name"]
+  }
+};
+
+const getSourceDocumentDeclaration = {
+  name: "getSourceDocument",
+  description: "Ritorna il link del file originale in Storage per una determinata pedana e data.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      platform: { type: Type.STRING, description: "Pedana ('sx' o 'dx')" },
+      date: { type: Type.STRING, description: "Data in formato YYYY-MM-DD" }
+    },
+    required: ["platform", "date"]
+  }
+};
+
+const getOriginalExcelDeclaration = {
+  name: "getOriginalExcel",
+  description: "Ritorna il link di download per l'Excel ABB25 originale.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {}
+  }
+};
+
+const proposeSubscriptionCardDeclaration = {
+  name: "proposeSubscriptionCard",
+  description: "Propone la creazione di una scheda abbonamento (bozza) modificabile sul frontend.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      customerName: { type: Type.STRING, description: "Nome completo del cliente" },
+      bedNumbers: { 
+        type: Type.ARRAY, 
+        items: { type: Type.INTEGER }, 
+        description: "Numeri dei lettini assegnati (1-109, totale max 84 lettini validi: 34 sx, 50 dx)" 
+      },
+      periods: { 
+        type: Type.ARRAY, 
+        items: { 
+          type: Type.OBJECT,
+          properties: {
+            startDate: { type: Type.STRING, description: "Data inizio YYYY-MM-DD" },
+            endDate: { type: Type.STRING, description: "Data fine YYYY-MM-DD" },
+            label: { type: Type.STRING, description: "Nome del periodo (es: Stagionale, Luglio, etc.)" }
+          },
+          required: ["startDate", "endDate"]
+        },
+        description: "Lista dei periodi richiesti"
+      },
+      priceMode: { type: Type.STRING, description: "Modalità di prezzo: listino, concordato, da_concordare" },
+      priceTotal: { type: Type.NUMBER, description: "Prezzo proposto totale (opzionale)" },
+      notes: { type: Type.STRING, description: "Note aggiuntive" }
+    },
+    required: ["customerName", "bedNumbers", "periods", "priceMode"]
+  }
+};
+
+const proposeDailyMapEntryDeclaration = {
+  name: "proposeDailyMapEntry",
+  description: "Propone la creazione di una prenotazione giornaliera (bozza) modificabile sul frontend.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      date: { type: Type.STRING, description: "Data della prenotazione YYYY-MM-DD" },
+      platform: { type: Type.STRING, description: "Pedana ('sx' o 'dx')" },
+      bedNumber: { type: Type.INTEGER, description: "Numero del lettino" },
+      customerName: { type: Type.STRING, description: "Nome del cliente" },
+      tipoPrenotazione: { type: Type.STRING, description: "Tipo di prenotazione: intera, mattina, pomeriggio, abbonato" },
+      slot: { type: Type.STRING, description: "Fascia oraria: full_day, morning, afternoon" },
+      notes: { type: Type.STRING, description: "Note o marcature estratte" }
+    },
+    required: ["date", "platform", "bedNumber", "customerName", "tipoPrenotazione", "slot"]
+  }
+};
+
+// AI Assistant endpoint using Google Gemini (via @google/genai)
+app.post("/api/ai-assistant", async (req, res) => {
+  try {
+    const { message, sessionId } = req.body;
+    if (!message || !sessionId) {
+      res.status(400).json({ error: "Messaggio e sessionId sono obbligatori." });
+      return;
+    }
+
+    await ensureServerAuth();
+
+    // 1. Fetch chat history for this sessionId from Firestore
+    const msgsRef = collection(db, "assistantSessions", sessionId, "messages");
+    const msgsSnap = await getDocs(msgsRef);
+    const history: any[] = [];
+    msgsSnap.forEach((docSnap) => {
+      history.push(docSnap.data());
+    });
+    history.sort((a, b) => (a.timestamp > b.timestamp ? 1 : -1));
+
+    // Limit history to keep tokens reasonable (last 16 messages)
+    const recentHistory = history.slice(-16);
+
+    // Build the message stream for Gemini
+    const geminiContents: any[] = recentHistory.map((m) => {
+      return {
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content || "" }] as any[]
+      };
+    });
+
+    // Add current user message
+    geminiContents.push({
+      role: "user",
+      parts: [{ text: message }] as any[]
+    });
+
+    const systemInstruction = `Sei l'Assistente AI del lido 'Samarinda' inserito nel gestionale.
+Il tuo ruolo è aiutare la reception a consultare le presenze storiche del lido, gli abbonamenti e l'anagrafica clienti, e a formulare nuove prenotazioni.
+
+Dettagli importanti sul lido Samarinda:
+- Bed totale del lido = 84 lettini validi in totale (34 pedana sinistra + 50 pedana destra). Non dire che ci sono 109 lettini in totale, anche se i numeri di lettino vanno da 1 a 109 con gap intermedi.
+- Pedana sinistra (SX): lettini da 1 a 34.
+- Pedana destra (DX): lettini da 60 a 109.
+- Slot disponibili per le prenotazioni: 'morning' (mattina), 'afternoon' (pomeriggio), 'full_day' (giornata intera).
+
+Le tue capacità:
+1. Ricercare nelle presenze storiche importate (dailyPresences) con 'searchDailyPresences' o 'getBedHistory'.
+2. Cercare negli abbonamenti attuali con 'searchSubscriptions'.
+3. Cercare i clienti con 'searchCustomers'.
+4. Fornire link di download ai documenti originali con 'getSourceDocument' e 'getOriginalExcel'.
+5. Proporre la creazione di un abbonamento con 'proposeSubscriptionCard'.
+6. Proporre una prenotazione giornaliera con 'proposeDailyMapEntry'.
+
+REGOLA DI SICUREZZA ASSOLUTA:
+Non puoi scrivere direttamente nel database le prenotazioni o abbonamenti. Puoi solo PROPORRE schede o inserimenti usando i relativi tool (proposeSubscriptionCard o proposeDailyMapEntry).
+L'utente vedrà una scheda interattiva e dovrà cliccare esplicitamente su 'Conferma' per avviare la scrittura sul database (tramite transazione sicura).
+Se l'utente ti chiede di inserire o confermare direttamente, digli cordialmente che per motivi di sicurezza le modifiche devono essere confermate cliccando l'apposito pulsante sulla scheda proposta.
+
+Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed elegante. Cita date, lettini e nomi precisi quando trovi corrispondenze nei dati.`;
+
+    const ai = getGemini();
+    const toolsList = [
+      {
+        functionDeclarations: [
+          searchDailyPresencesDeclaration,
+          getBedHistoryDeclaration,
+          searchSubscriptionsDeclaration,
+          searchCustomersDeclaration,
+          getSourceDocumentDeclaration,
+          getOriginalExcelDeclaration,
+          proposeSubscriptionCardDeclaration,
+          proposeDailyMapEntryDeclaration
+        ]
+      }
+    ];
+
+    // 2. Execute multi-turn tool calling loop
+    let currentContents = [...geminiContents];
+    let response = await generateContentWithRetry(ai, {
+      model: "gemini-3.5-flash",
+      contents: currentContents,
+      config: {
+        systemInstruction,
+        tools: toolsList
+      }
+    });
+
+    let toolAttempts = 0;
+    const allProposals: any[] = [];
+
+    while (response.functionCalls && response.functionCalls.length > 0 && toolAttempts < 5) {
+      toolAttempts++;
+
+      // Create model turn with functionCalls
+      const modelParts = response.functionCalls.map((fc: any) => ({
+        functionCall: {
+          name: fc.name,
+          args: fc.args,
+          id: fc.id
+        }
+      }));
+
+      currentContents.push({
+        role: "model",
+        parts: modelParts
+      });
+
+      const toolResponseParts: any[] = [];
+
+      for (const fc of response.functionCalls) {
+        const toolName = fc.name;
+        const args = fc.args as any;
+        const toolCallId = fc.id;
+
+        console.log(`[Gemini Tool] Executing: ${toolName}`, args);
+        let resultData: any = null;
+
+        try {
+          if (toolName === "searchDailyPresences") {
+            resultData = await searchDailyPresences(args.name, args.dateFrom, args.dateTo, args.platform);
+          } else if (toolName === "getBedHistory") {
+            resultData = await getBedHistory(args.bedNumber, args.platform, args.dateFrom, args.dateTo);
+          } else if (toolName === "searchSubscriptions") {
+            resultData = await searchSubscriptions(args.name);
+          } else if (toolName === "searchCustomers") {
+            resultData = await searchCustomers(args.name);
+          } else if (toolName === "getSourceDocument") {
+            resultData = await getSourceDocument(args.platform, args.date);
+          } else if (toolName === "getOriginalExcel") {
+            resultData = await getOriginalExcel();
+          } else if (toolName === "proposeSubscriptionCard") {
+            resultData = { status: "proposed_to_user", args };
+            allProposals.push({ type: "subscription", id: toolCallId || `prop_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`, data: args });
+          } else if (toolName === "proposeDailyMapEntry") {
+            resultData = { status: "proposed_to_user", args };
+            allProposals.push({ type: "daily_map", id: toolCallId || `prop_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`, data: args });
+          } else {
+            resultData = { error: "Strumento non riconosciuto." };
+          }
+        } catch (toolErr: any) {
+          console.error(`Error running tool ${toolName}:`, toolErr);
+          resultData = { error: toolErr.message || String(toolErr) };
+        }
+
+        toolResponseParts.push({
+          functionResponse: {
+            name: toolName,
+            response: { output: resultData },
+            id: toolCallId
+          }
+        });
+      }
+
+      currentContents.push({
+        role: "user",
+        parts: toolResponseParts
+      });
+
+      response = await generateContentWithRetry(ai, {
+        model: "gemini-3.5-flash",
+        contents: currentContents,
+        config: {
+          systemInstruction,
+          tools: toolsList
+        }
+      });
+    }
+
+    const textBlocks = response.text || "";
+
+    // 3. Persist the interaction to Firestore
+    const userMsgId = `user_${Date.now()}`;
+    await setDoc(doc(db, "assistantSessions", sessionId, "messages", userMsgId), {
+      role: "user",
+      content: message,
+      timestamp: new Date().toISOString()
+    });
+
+    const assistantMsgId = `assistant_${Date.now()}`;
+    const assistantMessageData = {
+      role: "assistant",
+      content: textBlocks,
+      proposals: allProposals,
+      timestamp: new Date().toISOString()
+    };
+    await setDoc(doc(db, "assistantSessions", sessionId, "messages", assistantMsgId), assistantMessageData);
+
+    res.json({
+      success: true,
+      text: textBlocks,
+      proposals: allProposals
+    });
+
+  } catch (err: any) {
+    console.error("Errore nell'endpoint /api/ai-assistant:", err);
+    res.status(500).json({ error: err.message || String(err) });
   }
 });
 

@@ -11,11 +11,13 @@ import SubscriptionsModule from "./components/SubscriptionsModule";
 import CashierModule from "./components/CashierModule";
 import PricingModule from "./components/PricingModule";
 import ClientView from "./components/ClientView"; // Vista Cliente pubblica (C)
+import SorgentiModule from "./components/SorgentiModule";
+import AIAssistantWidget from "./components/AIAssistantWidget";
 
 // Icons
-import { LayoutDashboard, QrCode, Users, Euro, Sparkles, Loader2, RefreshCw, Lock, LogOut, Globe, AlertTriangle, X } from "lucide-react";
+import { LayoutDashboard, QrCode, Users, Euro, Sparkles, Loader2, RefreshCw, Lock, LogOut, Globe, AlertTriangle, X, Folder } from "lucide-react";
 
-type ActiveTab = "map" | "scanner" | "subscriptions" | "cashier" | "pricing";
+type ActiveTab = "map" | "scanner" | "subscriptions" | "cashier" | "pricing" | "sorgenti";
 
 export default function App() {
   const [currentDate, setCurrentDate] = useState<string>("");
@@ -646,7 +648,8 @@ export default function App() {
               { id: "scanner", label: "Scanner Fogli", icon: QrCode },
               { id: "subscriptions", label: "Sezione Abbonati", icon: Users },
               { id: "cashier", label: "Cassa e Tab", icon: Euro },
-              { id: "pricing", label: "Listino Prezzi", icon: Sparkles }
+              { id: "pricing", label: "Listino Prezzi", icon: Sparkles },
+              { id: "sorgenti", label: "Archivio Sorgenti", icon: Folder }
             ].map((tab) => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
@@ -738,7 +741,14 @@ export default function App() {
           <PricingModule pricingConfigs={pricingConfigs} />
         )}
 
+        {activeTab === "sorgenti" && (
+          <SorgentiModule />
+        )}
+
       </main>
+
+      {/* FLOATING AI ASSISTANT WIDGET */}
+      <AIAssistantWidget />
 
       {/* 4. FOOTER */}
       <footer id="app-footer" className="bg-slate-100 border-t border-slate-200/50 py-4 text-center text-[10px] text-slate-400 px-4">

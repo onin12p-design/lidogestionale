@@ -5,6 +5,8 @@ import { getRomeTodayString, adjustDateString, formatItalianDate, isValidBedNumb
 import BedMap, { PEDANA_SINISTRA_LEFT, PEDANA_SINISTRA_RIGHT, PEDANA_DESTRA_LEFT, PEDANA_DESTRA_RIGHT } from "./BedMap";
 import { Calendar, ChevronLeft, ChevronRight, Search, Plus, Trash2, CreditCard, Coffee, Check, AlertCircle, Info, Users, Save, Clock, Printer, X, Maximize2, Minimize2, ExternalLink } from "lucide-react";
 import ConfirmationModal from "./ConfirmationModal";
+import { jsPDF } from "jspdf";
+import autoTable from "jspdf-autotable";
 
 interface DailyMapModuleProps {
   currentDate: string;
@@ -37,13 +39,176 @@ export default function DailyMapModule({
 }: DailyMapModuleProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
-  const [printEmptyMap, setPrintEmptyMap] = useState(false);
-  const [printEmptyList, setPrintEmptyList] = useState(false);
+  const [printType, setPrintType] = useState<"list" | "map" | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
-  
-  const bookingsToPrint = printEmptyMap ? [] : bookings;
   const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const handleGenerateDailyPDF = () => {
+    const doc = new jsPDF({
+      orientation: "portrait",
+      unit: "mm",
+      format: "a4"
+    });
+
+    const getFormattedNow = () => {
+      const now = new Date();
+      const day = String(now.getDate()).padStart(2, "0");
+      const month = String(now.getMonth() + 1).padStart(2, "0");
+      const year = now.getFullYear();
+      const hours = String(now.getHours()).padStart(2, "0");
+      const minutes = String(now.getMinutes()).padStart(2, "0");
+      return `${day}/${month}/${year} ${hours}:${minutes}`;
+    };
+
+    const drawHeader = (pageNumber: number) => {
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(16);
+      doc.setTextColor(2, 90, 112); // Samarinda #025A70
+      doc.text("LIDO SAMARINDA FINE BEACH", 14, 15);
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(100, 116, 139);
+      doc.text("REGISTRO GIORNALIERO CLIENTI", 14, 21);
+
+      const periodStr = `Giorno di Riferimento: ${formatItalianDate(currentDate)}`;
+      doc.text(periodStr, 14, 27);
+
+      const genTimeStr = `Generato il: ${getFormattedNow()}`;
+      doc.text(genTimeStr, 135, 27);
+
+      doc.setDrawColor(226, 232, 240);
+      doc.line(14, 31, 196, 31);
+    };
+
+    const leftBookings = bookings.filter(b => b.bedNumber <= 34).sort((a, b) => a.bedNumber - b.bedNumber);
+    const rightBookings = bookings.filter(b => b.bedNumber > 34).sort((a, b) => a.bedNumber - b.bedNumber);
+    const sortedBookings = [...leftBookings, ...rightBookings];
+
+    const paymentsByBookingId = new Map<string, Payment[]>();
+    payments.forEach(p => {
+      if (p.bookingId) {
+        if (!paymentsByBookingId.has(p.bookingId)) {
+          paymentsByBookingId.set(p.bookingId, []);
+        }
+        paymentsByBookingId.get(p.bookingId)!.push(p);
+      }
+    });
+
+    const tableBody = sortedBookings.map((b) => {
+      const isSubscriber = b.customerType === "subscriber";
+      const isHotel = b.isHotel;
+      const tipoLabel = isSubscriber ? "Abbonamento" : isHotel ? "Hotel" : "Giornaliero";
+      const side = b.bedNumber <= 34 ? "SX" : "DX";
+
+      const bPayments = paymentsByBookingId.get(b.id) || [];
+      let amountText = "–";
+      let methodText = "Da pagare";
+      if (bPayments.length > 0) {
+        const totalAmount = bPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
+        amountText = `${totalAmount} €`;
+        const methodsSet = new Set(bPayments.map(p => {
+          if (p.method === "card") return "Carta";
+          if (p.method === "cash") return "Contanti";
+          return p.method || "";
+        }).filter(Boolean));
+        methodText = Array.from(methodsSet).join(" + ") || "Da pagare";
+      }
+
+      return [
+        `${b.bedNumber} ${side}`,
+        b.customerName,
+        tipoLabel,
+        b.notes || "-",
+        amountText,
+        methodText
+      ];
+    });
+
+    let totalIncassato = 0;
+    let totalContanti = 0;
+    let totalCarta = 0;
+    let countContanti = 0;
+    let countCarta = 0;
+
+    payments.forEach(p => {
+      const amt = p.amount || 0;
+      totalIncassato += amt;
+      if (p.method === "cash") {
+        totalContanti += amt;
+        countContanti++;
+      } else if (p.method === "card") {
+        totalCarta += amt;
+        countCarta++;
+      }
+    });
+
+    autoTable(doc, {
+      startY: 38,
+      head: [["Postazione", "Cliente/Nome", "Tipo", "Note", "Importo (€)", "Metodo"]],
+      body: tableBody,
+      theme: "striped",
+      headStyles: { fillColor: [2, 90, 112] },
+      styles: { font: "helvetica", fontSize: 9, cellPadding: 3 },
+      columnStyles: {
+        0: { cellWidth: 25, halign: "center", fontStyle: "bold" },
+        1: { cellWidth: 50 },
+        2: { cellWidth: 30 },
+        3: { cellWidth: 37 },
+        4: { cellWidth: 22, halign: "right" },
+        5: { cellWidth: 20, halign: "center" }
+      },
+      margin: { top: 38, left: 14, right: 14, bottom: 45 },
+      didDrawPage: (data) => {
+        drawHeader(data.pageNumber);
+      }
+    });
+
+    const finalY = (doc as any).lastAutoTable.finalY || 38;
+    const pageHeight = doc.internal.pageSize.height;
+    
+    let summaryY = finalY + 10;
+    if (summaryY + 30 > pageHeight) {
+      doc.addPage();
+      drawHeader(1);
+      summaryY = 38;
+    }
+
+    doc.setDrawColor(226, 232, 240);
+    doc.setFillColor(248, 250, 252);
+    doc.roundedRect(14, summaryY, 182, 26, 3, 3, "FD");
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10);
+    doc.setTextColor(15, 23, 42);
+    doc.text("RIEPILOGO GIORNALIERO", 18, summaryY + 6);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(71, 85, 105);
+    doc.text(`Totale Clienti Presenti: ${bookings.length}`, 18, summaryY + 12);
+    doc.text(`Totale Incassato:`, 18, summaryY + 18);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(2, 90, 112);
+    doc.text(`${totalIncassato} €`, 47, summaryY + 18);
+
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(71, 85, 105);
+    doc.text(`di cui Contanti:`, 85, summaryY + 18);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(15, 23, 42);
+    doc.text(`${totalContanti} € (${countContanti} pagamenti)`, 110, summaryY + 18);
+
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(71, 85, 105);
+    doc.text(`di cui Carta:`, 85, summaryY + 23);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(15, 23, 42);
+    doc.text(`${totalCarta} € (${countCarta} pagamenti)`, 110, summaryY + 23);
+
+    doc.save(`registro_giornaliero_${currentDate}.pdf`);
+  };
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [confirmDeleteAllOpen, setConfirmDeleteAllOpen] = useState(false);
@@ -577,45 +742,29 @@ export default function DailyMapModule({
             </div>
 
             <button
-              id="btn-print-map"
+              id="btn-print-list-clienti"
               onClick={() => {
-                setPrintEmptyMap(false);
-                setPrintEmptyList(false);
+                setPrintType("list");
                 setIsPrintModalOpen(true);
               }}
-              className="px-3 py-2 bg-[#025A70]/10 hover:bg-[#025A70]/20 text-[#025A70] font-black text-[11px] rounded-xl transition-all shadow-sm flex items-center gap-1.5 cursor-pointer shrink-0 border border-[#025A70]/10 h-9"
-              title="Stampa mappa e lista prenotazioni del giorno"
+              className="px-3 py-2 bg-[#025A70]/10 hover:bg-[#025A70]/20 text-[#025A70] font-black text-[11.5px] rounded-xl transition-all shadow-sm flex items-center gap-1.5 cursor-pointer shrink-0 border border-[#025A70]/10 h-9"
+              title="Stampa lista clienti presenti/assegnati"
             >
               <Printer className="w-3.5 h-3.5" />
-              <span>Stampa Mappa</span>
+              <span>Stampa lista clienti</span>
             </button>
 
             <button
-              id="btn-print-empty-map"
+              id="btn-print-mappa-spiaggia"
               onClick={() => {
-                setPrintEmptyMap(true);
-                setPrintEmptyList(false);
+                setPrintType("map");
                 setIsPrintModalOpen(true);
               }}
-              className="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-black text-[11px] rounded-xl transition-all shadow-sm flex items-center gap-1.5 cursor-pointer shrink-0 border border-emerald-100 h-9"
-              title="Stampa mappa vuota senza prenotazioni (tutti i posti bianchi)"
+              className="px-3 py-2 bg-[#025A70]/10 hover:bg-[#025A70]/20 text-[#025A70] font-black text-[11.5px] rounded-xl transition-all shadow-sm flex items-center gap-1.5 cursor-pointer shrink-0 border border-[#025A70]/10 h-9"
+              title="Stampa mappa/pianta delle postazioni"
             >
               <Printer className="w-3.5 h-3.5" />
-              <span>Stampa Mappa Vuota</span>
-            </button>
-
-            <button
-              id="btn-print-empty-list"
-              onClick={() => {
-                setPrintEmptyMap(false);
-                setPrintEmptyList(true);
-                setIsPrintModalOpen(true);
-              }}
-              className="px-3 py-2 bg-amber-50 hover:bg-amber-100 text-amber-700 font-black text-[11px] rounded-xl transition-all shadow-sm flex items-center gap-1.5 cursor-pointer shrink-0 border border-amber-100 h-9"
-              title="Stampa tabella vuota per la registrazione cartacea di emergenza"
-            >
-              <Printer className="w-3.5 h-3.5" />
-              <span>Stampa Elenco Vuoto</span>
+              <span>Stampa mappa</span>
             </button>
 
             <button
@@ -1213,53 +1362,143 @@ export default function DailyMapModule({
       />
 
       {/* PRINTABLE MAP MODAL OVERLAY */}
-      {isPrintModalOpen && (
+      {isPrintModalOpen && printType && (
         <div id="print-modal-overlay" className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex flex-col p-4 md:p-8 overflow-y-auto print:static print:block print:p-0 print:m-0 print:bg-white print:overflow-visible print:h-auto print:w-full">
-          <style dangerouslySetInnerHTML={{ __html: `
-            @media print {
-              html, body, #root {
-                height: auto !important;
-                overflow: visible !important;
-                position: static !important;
+          
+          {/* Dynamic Style Injection for portrait vs landscape A4 print sizing */}
+          {printType === "list" ? (
+            <style dangerouslySetInnerHTML={{ __html: `
+              @media print {
+                @page {
+                  size: portrait;
+                  margin: 15mm;
+                }
+                html, body, #root {
+                  height: auto !important;
+                  overflow: visible !important;
+                  position: static !important;
+                  background: white !important;
+                }
+                body * {
+                  visibility: hidden !important;
+                }
+                #print-modal-overlay, #print-preview-document, #print-preview-document * {
+                  visibility: visible !important;
+                }
+                #print-modal-overlay {
+                  position: static !important;
+                  display: block !important;
+                  padding: 0 !important;
+                  margin: 0 !important;
+                  overflow: visible !important;
+                  height: auto !important;
+                  width: 100% !important;
+                  background: white !important;
+                }
+                #print-preview-document {
+                  position: static !important;
+                  display: block !important;
+                  width: 100% !important;
+                  height: auto !important;
+                  overflow: visible !important;
+                  background: white !important;
+                  color: black !important;
+                  padding: 0 !important;
+                  margin: 0 !important;
+                  box-shadow: none !important;
+                }
+                /* Repeated table header and styling for Vertical A4 client list */
+                thead {
+                  display: table-header-group !important;
+                }
+                tr {
+                  page-break-inside: avoid !important;
+                }
+                .even\\:bg-slate-50\\/80 {
+                  background-color: #f8fafc !important;
+                  -webkit-print-color-adjust: exact !important;
+                  print-color-adjust: exact !important;
+                }
+                .bg-slate-100 {
+                  background-color: #f1f5f9 !important;
+                  -webkit-print-color-adjust: exact !important;
+                  print-color-adjust: exact !important;
+                }
               }
-              body * {
-                visibility: hidden !important;
+            `}} />
+          ) : (
+            <style dangerouslySetInnerHTML={{ __html: `
+              @media print {
+                @page {
+                  size: landscape;
+                  margin: 5mm;
+                }
+                html, body, #root {
+                  height: auto !important;
+                  overflow: visible !important;
+                  position: static !important;
+                  background: white !important;
+                }
+                body * {
+                  visibility: hidden !important;
+                }
+                #print-modal-overlay, #print-preview-document, #print-preview-document * {
+                  visibility: visible !important;
+                }
+                #print-modal-overlay {
+                  position: static !important;
+                  display: block !important;
+                  padding: 0 !important;
+                  margin: 0 !important;
+                  overflow: visible !important;
+                  height: auto !important;
+                  width: 100% !important;
+                  background: white !important;
+                }
+                #print-preview-document {
+                  position: static !important;
+                  display: block !important;
+                  width: 100% !important;
+                  height: auto !important;
+                  overflow: visible !important;
+                  background: white !important;
+                  color: black !important;
+                  padding: 0 !important;
+                  margin: 0 !important;
+                  box-shadow: none !important;
+                }
+                .print-map-container {
+                  page-break-inside: avoid !important;
+                  max-height: 98vh !important;
+                  overflow: hidden !important;
+                }
+                /* Force background color display in B&W / Color print previews */
+                .bg-slate-900 {
+                  background-color: #0f172a !important;
+                  color: white !important;
+                  -webkit-print-color-adjust: exact !important;
+                  print-color-adjust: exact !important;
+                }
+                .text-white {
+                  color: #ffffff !important;
+                }
               }
-              #print-modal-overlay, #print-preview-document, #print-preview-document * {
-                visibility: visible !important;
-              }
-              #print-modal-overlay {
-                position: static !important;
-                display: block !important;
-                padding: 0 !important;
-                margin: 0 !important;
-                overflow: visible !important;
-                height: auto !important;
-                width: 100% !important;
-                background: white !important;
-              }
-              #print-preview-document {
-                position: static !important;
-                display: block !important;
-                width: 100% !important;
-                height: auto !important;
-                overflow: visible !important;
-                background: white !important;
-                color: black !important;
-                padding: 0 !important;
-                margin: 0 !important;
-                box-shadow: none !important;
-              }
-            }
-          `}} />
+            `}} />
+          )}
 
           {/* Action Header - Hidden during actual print */}
-          <div className="bg-white rounded-t-2xl border-b border-slate-100 p-4 max-w-5xl w-full mx-auto flex items-center justify-between shadow-sm print:hidden">
+          <div className="bg-white rounded-t-2xl border-b border-slate-100 p-4 max-w-5xl w-full mx-auto flex items-center justify-between shadow-sm print:hidden shrink-0">
             <div className="flex items-center gap-2">
               <Printer className="w-5 h-5 text-[#025A70]" />
-              <div>
-                <h3 className="text-sm font-black text-slate-800 uppercase tracking-wide">Anteprima di Stampa Mappa</h3>
-                <p className="text-[10px] text-slate-400 font-medium">Ottimizzato per foglio A4 (Usa orientamento Landscape/Orizzontale per la resa migliore)</p>
+              <div className="text-left">
+                <h3 className="text-sm font-black text-slate-800 uppercase tracking-wide">
+                  {printType === "list" ? "Anteprima di Stampa: Lista Clienti" : "Anteprima di Stampa: Pianta Spiaggia"}
+                </h3>
+                <p className="text-[10px] text-slate-400 font-medium">
+                  {printType === "list" 
+                    ? "Ottimizzato per foglio A4 Verticale (Usa orientamento Portrait/Verticale)" 
+                    : "Ottimizzato per foglio A4 Orizzontale (Usa orientamento Landscape/Orizzontale)"}
+                </p>
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -1267,8 +1506,14 @@ export default function DailyMapModule({
                 id="btn-trigger-browser-print"
                 onClick={() => {
                   try {
-                    window.focus();
-                    window.print();
+                    if (printType === "list") {
+                      handleGenerateDailyPDF();
+                      setIsPrintModalOpen(false);
+                      setPrintType(null);
+                    } else {
+                      window.focus();
+                      window.print();
+                    }
                   } catch (e) {
                     console.error("Print error:", e);
                   }
@@ -1280,7 +1525,10 @@ export default function DailyMapModule({
               </button>
               <button
                 id="btn-close-print-modal"
-                onClick={() => setIsPrintModalOpen(false)}
+                onClick={() => {
+                  setIsPrintModalOpen(false);
+                  setPrintType(null);
+                }}
                 className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-all cursor-pointer"
               >
                 <X className="w-5 h-5" />
@@ -1290,15 +1538,15 @@ export default function DailyMapModule({
 
           {/* Iframe sandbox warning banner - Hidden during actual print */}
           {typeof window !== "undefined" && window.self !== window.top && (
-            <div className="bg-amber-50 border-x border-b border-amber-100 p-4 max-w-5xl w-full mx-auto flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-inner print:hidden">
+            <div className="bg-amber-50 border-x border-b border-amber-100 p-4 max-w-5xl w-full mx-auto flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-inner print:hidden shrink-0">
               <div className="flex items-start gap-2.5 text-amber-800 text-xs font-semibold">
                 <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-                <div className="space-y-0.5">
+                <div className="space-y-0.5 text-left">
                   <p className="font-extrabold text-amber-900 uppercase tracking-wider text-[11px]">Avviso Anteprima Protetta</p>
-                  <p className="leading-relaxed text-slate-600 font-medium">
+                  <p className="leading-relaxed text-slate-600 font-medium text-[11px]">
                     I browser moderni bloccano l'apertura della finestra di stampa (<code className="font-mono bg-amber-100/80 px-1 py-0.5 rounded text-amber-900">window.print()</code>) quando l'applicazione è incorporata all'interno dell'anteprima di AI Studio.
                   </p>
-                  <p className="leading-relaxed text-slate-600 font-bold">
+                  <p className="leading-relaxed text-slate-600 font-bold text-[11px]">
                     Per stampare correttamente, fai clic sul pulsante a destra "Apri in Nuova Scheda" per caricare l'applicazione a schermo intero!
                   </p>
                 </div>
@@ -1316,288 +1564,349 @@ export default function DailyMapModule({
           )}
 
           {/* Printable Document Area */}
-          <div id="print-preview-document" className="bg-white p-6 md:p-10 max-w-5xl w-full mx-auto rounded-b-2xl shadow-lg text-black print:shadow-none print:p-0 print:m-0">
-             {/* Header */}
-            <div className="border-b-2 border-black pb-4 mb-6 flex justify-between items-end">
-              <div>
-                <h1 className="text-xl font-extrabold tracking-wide uppercase">STABILIMENTO BALNEARE SAMARINDA</h1>
-                <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mt-0.5">
-                  {printEmptyList 
-                    ? "REGISTRO PRENOTAZIONI EMERGENZA (TABELLA CARTACEA)" 
-                    : printEmptyMap 
-                      ? "PIANO SPIAGGIA VUOTO (MAPPA CARTACEA)" 
-                      : "PIANO DELLA SPIAGGIA E REGISTRO PRENOTAZIONI"}
-                </p>
-              </div>
-              <div className="text-right">
-                <span className="text-[10px] font-bold text-slate-400 uppercase block">Giorno di Riferimento</span>
-                <span className="text-sm font-black text-black bg-slate-100/60 px-2 py-1 rounded border border-slate-200 uppercase print:bg-white print:border-none print:p-0">{formatItalianDate(currentDate)}</span>
-              </div>
-            </div>
+          <div id="print-preview-document" className="bg-white p-6 md:p-10 max-w-5xl w-full mx-auto rounded-b-2xl shadow-lg text-black print:shadow-none print:p-0 print:m-0 overflow-y-auto">
+            
+            {/* STAMPA LISTA CLIENTI */}
+            {printType === "list" && (
+              <div id="print-list-content" className="space-y-6 text-black">
+                {/* Header */}
+                <div className="border-b-2 border-black pb-4 flex justify-between items-end">
+                  <div className="text-left">
+                    <h1 className="text-xl font-black tracking-wide uppercase text-slate-900">LIDO SAMARINDA FINE BEACH</h1>
+                    <p className="text-xs text-slate-500 font-bold uppercase tracking-wider mt-0.5">
+                      Registro Giornaliero Clienti Assegnati alle Postazioni
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase block">Giorno di Riferimento</span>
+                    <span className="text-sm font-black text-black bg-slate-100/60 px-2 py-1 rounded border border-slate-200 uppercase print:bg-white print:border-none print:p-0">
+                      {formatItalianDate(currentDate)}
+                    </span>
+                  </div>
+                </div>
 
-            {/* Micro instructions / Legend */}
-            {!printEmptyList && (
-              <div className="grid grid-cols-4 gap-4 mb-6 text-[10px] bg-slate-50 p-3 rounded-xl border border-slate-100 print:bg-white print:border-black print:rounded-none">
-                <div className="flex items-center gap-1.5">
-                  <span className="w-3 h-3 border border-black inline-block bg-white text-center font-extrabold text-[8px]">AM</span>
-                  <span>Mattina (Solo mattina prenotata)</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="w-3 h-3 border border-black inline-block bg-white text-center font-extrabold text-[8px]">PM</span>
-                  <span>Pomeriggio (Solo pomeriggio prenotato)</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="w-3 h-3 border border-black inline-block bg-white text-center font-extrabold text-[8px]">G</span>
-                  <span>Giornata Intera (Occupato tutto il giorno)</span>
-                </div>
-                <div className="text-right text-slate-500 flex items-center justify-end gap-1 font-medium">
-                  <span>Prenotazioni attive: <strong>{bookingsToPrint.length}</strong></span>
-                </div>
-              </div>
-            )}
-
-            {printEmptyList ? (
-              <div className="space-y-4">
-                <div className="border border-black p-4 bg-white">
-                  <h3 className="text-xs font-black uppercase text-center mb-4 tracking-wider border-b border-black pb-2">
-                    REGISTRAZIONE MANUALE PRENOTAZIONI SPIAGGIA
-                  </h3>
-                  <table className="w-full border-collapse border border-black text-[10px]">
+                {/* Tabella clienti ordinata per numero postazione crescente, prima SX poi DX */}
+                <div className="mt-4">
+                  <table className="w-full text-left text-[11pt] border-collapse border border-slate-300">
                     <thead>
-                      <tr className="bg-slate-50 print:bg-slate-150">
-                        <th className="border border-black px-3 py-2 text-center font-black w-20">OMBRELLONE</th>
-                        <th className="border border-black px-3 py-2 text-left font-black w-56">NOME CLIENTE</th>
-                        <th className="border border-black px-3 py-2 text-center font-black w-24">FASCIA ORARIA</th>
-                        <th className="border border-black px-3 py-2 text-left font-black">NOTE ED EVENTUALI DETTAGLI / EXTRA</th>
-                        <th className="border border-black px-3 py-2 text-center font-black w-36">FIRMA OPERATORE / CLIENTE</th>
+                      <tr className="bg-slate-100 border-b-2 border-slate-400 text-slate-800 font-bold" style={{ display: "table-header-group" }}>
+                        <th className="py-2.5 px-3 border border-slate-300 text-center w-28 text-[11pt]">Postazione</th>
+                        <th className="py-2.5 px-3 border border-slate-300 text-[11pt]">Cliente/Nome</th>
+                        <th className="py-2.5 px-3 border border-slate-300 w-44 text-[11pt]">Tipo</th>
+                        <th className="py-2.5 px-3 border border-slate-300 text-[11pt]">Note</th>
+                        <th className="py-2.5 px-3 border border-slate-300 text-right w-28 text-[11pt]">Importo (€)</th>
+                        <th className="py-2.5 px-3 border border-slate-300 text-center w-36 text-[11pt]">Metodo</th>
                       </tr>
                     </thead>
-                    <tbody>
-                      {Array.from({ length: 22 }).map((_, idx) => (
-                        <tr key={idx} className="h-10">
-                          <td className="border border-black text-center font-bold"></td>
-                          <td className="border border-black px-3 py-2"></td>
-                          <td className="border border-black text-center font-semibold text-[8px] text-slate-400">AM / PM / G</td>
-                          <td className="border border-black px-3 py-2"></td>
-                          <td className="border border-black px-3 py-2"></td>
-                        </tr>
-                      ))}
+                    <tbody className="divide-y divide-slate-200">
+                      {(() => {
+                        const leftBookings = bookings.filter(b => b.bedNumber <= 34).sort((a, b) => a.bedNumber - b.bedNumber);
+                        const rightBookings = bookings.filter(b => b.bedNumber > 34).sort((a, b) => a.bedNumber - b.bedNumber);
+                        const sortedBookings = [...leftBookings, ...rightBookings];
+
+                        if (sortedBookings.length === 0) {
+                          return (
+                            <tr>
+                              <td colSpan={6} className="py-8 text-center text-slate-400 italic">
+                                Nessun cliente presente nelle postazioni per il giorno selezionato.
+                              </td>
+                            </tr>
+                          );
+                        }
+
+                        return sortedBookings.map((b) => {
+                          const isSubscriber = b.customerType === "subscriber";
+                          const isHotel = b.isHotel;
+                          const tipoLabel = isSubscriber ? "Abbonamento" : isHotel ? "Hotel" : "Giornaliero";
+                          const side = b.bedNumber <= 34 ? "SX" : "DX";
+                          
+                          // Look up payments for this booking
+                          const bPayments = payments.filter((p) => p.bookingId === b.id);
+                          let amountText = "–";
+                          let methodText = "Da pagare";
+                          if (bPayments.length > 0) {
+                            const totalAmount = bPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
+                            amountText = `${totalAmount} €`;
+                            const methodsSet = new Set(bPayments.map(p => {
+                              if (p.method === "card") return "Carta";
+                              if (p.method === "cash") return "Contanti";
+                              return p.method || "";
+                            }).filter(Boolean));
+                            methodText = Array.from(methodsSet).join(" + ") || "Da pagare";
+                          }
+
+                          return (
+                            <tr key={b.id} className="even:bg-slate-50/80">
+                              <td className="py-2.5 px-3 border border-slate-300 font-extrabold text-center text-slate-900 bg-slate-50/50">
+                                {b.bedNumber} {side}
+                              </td>
+                              <td className="py-2.5 px-3 border border-slate-300 font-bold uppercase text-slate-900">
+                                {b.customerName}
+                              </td>
+                              <td className="py-2.5 px-3 border border-slate-300 font-medium text-slate-700">
+                                {tipoLabel}
+                              </td>
+                              <td className="py-2.5 px-3 border border-slate-300 text-slate-600 text-[11pt]">
+                                {b.notes || "-"}
+                              </td>
+                              <td className="py-2.5 px-3 border border-slate-300 font-bold text-right text-slate-950">
+                                {amountText}
+                              </td>
+                              <td className="py-2.5 px-3 border border-slate-300 font-bold text-center text-slate-800">
+                                {methodText}
+                              </td>
+                            </tr>
+                          );
+                        });
+                      })()}
                     </tbody>
                   </table>
                 </div>
-              </div>
-            ) : (
-              <div className="space-y-6">
-              
-              {/* PEDANA SINISTRA */}
-              <div className="border border-black p-4 bg-white">
-                <h3 className="text-xs font-black uppercase text-center mb-3 tracking-wider border-b border-black pb-1">PEDANA SINISTRA</h3>
-                <div className="grid grid-cols-2 gap-4">
-                  
-                  {/* Griglia Sinistra */}
-                  <div className="space-y-1">
-                    <span className="text-[8px] font-bold uppercase block text-center text-slate-500">Griglia Sinistra (1-34)</span>
-                    <div className="grid grid-cols-5 gap-1">
-                      {PEDANA_SINISTRA_LEFT.flatMap((row) => row).map((bedNum, idx) => {
-                        if (bedNum === null) return <div key={`print-ps-left-null-${idx}`} className="h-10 border border-transparent"></div>;
-                        const bList = bookingsToPrint.filter((b) => b.bedNumber === bedNum);
-                        return (
-                          <div key={`print-ps-left-${bedNum}`} className="border border-black p-0.5 text-center flex flex-col justify-between h-10 bg-white">
-                            <span className="text-[10px] font-black leading-none">{bedNum}</span>
-                            {bList.length > 0 ? (
-                              <div className="text-[6.5px] font-extrabold truncate uppercase leading-none text-slate-800">
-                                {bList.map((b) => (
-                                  <div key={b.id} className="truncate">
-                                    {b.slot === "morning" ? "M:" : b.slot === "afternoon" ? "P:" : "G:"}{b.customerName.split(" ")[0] || b.customerName}
-                                  </div>
-                                ))}
-                              </div>
-                            ) : (
-                              <span className="text-[6px] text-slate-300 font-medium tracking-tighter leading-none">LIBERO</span>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
 
-                  {/* Griglia Destra */}
-                  <div className="space-y-1">
-                    <span className="text-[8px] font-bold uppercase block text-center text-slate-500">Griglia Destra (6-30)</span>
-                    <div className="grid grid-cols-5 gap-1">
-                      {PEDANA_SINISTRA_RIGHT.flatMap((row) => row).map((bedNum, idx) => {
-                        if (bedNum === null) return <div key={`print-ps-right-null-${idx}`} className="h-10 border border-transparent"></div>;
-                        const bList = bookingsToPrint.filter((b) => b.bedNumber === bedNum);
-                        return (
-                          <div key={`print-ps-right-${bedNum}`} className="border border-black p-0.5 text-center flex flex-col justify-between h-10 bg-white">
-                            <span className="text-[10px] font-black leading-none">{bedNum}</span>
-                            {bList.length > 0 ? (
-                              <div className="text-[6.5px] font-extrabold truncate uppercase leading-none text-slate-800">
-                                {bList.map((b) => (
-                                  <div key={b.id} className="truncate">
-                                    {b.slot === "morning" ? "M:" : b.slot === "afternoon" ? "P:" : "G:"}{b.customerName.split(" ")[0] || b.customerName}
-                                  </div>
-                                ))}
-                              </div>
-                            ) : (
-                              <span className="text-[6px] text-slate-300 font-medium tracking-tighter leading-none">LIBERO</span>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
+                {/* Riepilogo Giornaliero */}
+                {(() => {
+                  let totalIncassato = 0;
+                  let totalContanti = 0;
+                  let totalCarta = 0;
+                  let countContanti = 0;
+                  let countCarta = 0;
 
+                  payments.forEach(p => {
+                    const amt = p.amount || 0;
+                    totalIncassato += amt;
+                    if (p.method === "cash") {
+                      totalContanti += amt;
+                      countContanti++;
+                    } else if (p.method === "card") {
+                      totalCarta += amt;
+                      countCarta++;
+                    }
+                  });
+
+                  return (
+                    <div className="bg-slate-50 border border-slate-200 rounded-2xl p-5 space-y-3 mt-6">
+                      <h4 className="text-sm font-black text-slate-800 uppercase tracking-wide">Riepilogo Giornaliero</h4>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-bold text-slate-600 uppercase tracking-wider">
+                        <div className="bg-white border border-slate-100 p-3 rounded-xl shadow-sm">
+                          <span className="block text-slate-400 text-[10px]">Totale Incassato</span>
+                          <span className="text-lg font-black text-[#025A70]">{totalIncassato} €</span>
+                        </div>
+                        <div className="bg-white border border-slate-100 p-3 rounded-xl shadow-sm">
+                          <span className="block text-slate-400 text-[10px]">di cui Contanti</span>
+                          <span className="text-lg font-black text-slate-800">{totalContanti} € ({countContanti} pagamenti)</span>
+                        </div>
+                        <div className="bg-white border border-slate-100 p-3 rounded-xl shadow-sm">
+                          <span className="block text-slate-400 text-[10px]">di cui Carta</span>
+                          <span className="text-lg font-black text-slate-800">{totalCarta} € ({countCarta} pagamenti)</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Totale clienti in calce */}
+                <div className="mt-8 pt-4 border-t border-slate-300 flex justify-between items-center text-xs text-slate-500 font-bold uppercase tracking-wider">
+                  <span>Totale Clienti Presenti: {bookings.length}</span>
+                  <span>Stampato il {new Date().toLocaleDateString("it-IT")}</span>
                 </div>
               </div>
+            )}
 
-              {/* PEDANA DESTRA */}
-              <div className="border border-black p-4 bg-white">
-                <h3 className="text-xs font-black uppercase text-center mb-3 tracking-wider border-b border-black pb-1">PEDANA DESTRA</h3>
-                <div className="grid grid-cols-2 gap-4">
-                  
-                  {/* Griglia Sinistra */}
-                  <div className="space-y-1">
-                    <span className="text-[8px] font-bold uppercase block text-center text-slate-500">Griglia Sinistra (60-97)</span>
-                    <div className="grid grid-cols-5 gap-1">
-                      {PEDANA_DESTRA_LEFT.flatMap((row) => row).map((bedNum, idx) => {
-                        if (bedNum === null) return <div key={`print-pd-left-null-${idx}`} className="h-10 border border-transparent"></div>;
-                        const bList = bookingsToPrint.filter((b) => b.bedNumber === bedNum);
-                        return (
-                          <div key={`print-pd-left-${bedNum}`} className="border border-black p-0.5 text-center flex flex-col justify-between h-10 bg-white">
-                            <span className="text-[10px] font-black leading-none">{bedNum}</span>
-                            {bList.length > 0 ? (
-                              <div className="text-[6.5px] font-extrabold truncate uppercase leading-none text-slate-800">
-                                {bList.map((b) => (
-                                  <div key={b.id} className="truncate">
-                                    {b.slot === "morning" ? "M:" : b.slot === "afternoon" ? "P:" : "G:"}{b.customerName.split(" ")[0] || b.customerName}
-                                  </div>
-                                ))}
+            {/* STAMPA MAPPA SPIAGGIA */}
+            {printType === "map" && (
+              <div id="print-map-content" className="space-y-4 text-black">
+                {/* Header */}
+                <div className="border-b border-slate-200 pb-2 flex justify-between items-end">
+                  <div className="text-left">
+                    <h1 className="text-lg font-black tracking-wide uppercase text-slate-900">LIDO SAMARINDA — PIANTA SPIAGGIA</h1>
+                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mt-0.5">
+                      Mappa grafica delle postazioni spiaggia per la gestione cartacea giornaliera
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <span className="text-[8px] font-bold text-slate-400 uppercase block">Giorno di Riferimento</span>
+                    <span className="text-xs font-black text-black bg-slate-100/60 px-2 py-0.5 rounded border border-slate-200 uppercase print:bg-white print:border-none print:p-0">
+                      {formatItalianDate(currentDate)}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Map grid side-by-side to fit on a single landscape page */}
+                <div className="grid grid-cols-2 gap-3 print-map-container">
+                  {/* PEDANA SINISTRA */}
+                  <div className="border border-slate-300 p-2.5 rounded-xl bg-white flex flex-col justify-between">
+                    <h3 className="text-[10px] font-black uppercase text-center mb-2 tracking-wider border-b border-slate-200 pb-0.5 text-slate-800">
+                      PEDANA SINISTRA
+                    </h3>
+                    <div className="grid grid-cols-2 gap-3">
+                      {/* Griglia Sinistra */}
+                      <div className="space-y-1">
+                        <span className="text-[8px] font-bold uppercase block text-center text-slate-400">Griglia Sinistra (1-34)</span>
+                        <div className="grid grid-cols-5 gap-1">
+                          {PEDANA_SINISTRA_LEFT.flatMap((row) => row).map((bedNum, idx) => {
+                            if (bedNum === null) return <div key={`print-ps-left-null-${idx}`} className="h-8 border border-transparent"></div>;
+                            const bList = bookings.filter((b) => b.bedNumber === bedNum);
+                            const surnameText = bList.map(b => {
+                              const parts = b.customerName.trim().split(/\s+/);
+                              return parts.length > 1 ? parts[parts.length - 1] : parts[0];
+                            }).join("/");
+                            const isOccupied = bList.length > 0;
+                            return (
+                              <div 
+                                key={`print-ps-left-${bedNum}`} 
+                                className={`p-0.5 text-center flex flex-col justify-center h-8 rounded ${
+                                  isOccupied 
+                                    ? "bg-slate-900 text-white border border-slate-900" 
+                                    : "border border-slate-300 bg-white text-slate-800"
+                                }`}
+                              >
+                                <span className={`text-[9px] font-black leading-none ${isOccupied ? "text-white" : "text-slate-800"}`}>
+                                  {bedNum}
+                                </span>
+                                {isOccupied && (
+                                  <span className="text-[6px] font-bold truncate uppercase leading-none mt-0.5 text-white block">
+                                    {surnameText}
+                                  </span>
+                                )}
                               </div>
-                            ) : (
-                              <span className="text-[6px] text-slate-300 font-medium tracking-tighter leading-none">LIBERO</span>
-                            )}
-                          </div>
-                        );
-                      })}
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Griglia Destra */}
+                      <div className="space-y-1">
+                        <span className="text-[8px] font-bold uppercase block text-center text-slate-400">Griglia Destra (6-30)</span>
+                        <div className="grid grid-cols-5 gap-1">
+                          {PEDANA_SINISTRA_RIGHT.flatMap((row) => row).map((bedNum, idx) => {
+                            if (bedNum === null) return <div key={`print-ps-right-null-${idx}`} className="h-8 border border-transparent"></div>;
+                            const bList = bookings.filter((b) => b.bedNumber === bedNum);
+                            const surnameText = bList.map(b => {
+                              const parts = b.customerName.trim().split(/\s+/);
+                              return parts.length > 1 ? parts[parts.length - 1] : parts[0];
+                            }).join("/");
+                            const isOccupied = bList.length > 0;
+                            return (
+                              <div 
+                                key={`print-ps-right-${bedNum}`} 
+                                className={`p-0.5 text-center flex flex-col justify-center h-8 rounded ${
+                                  isOccupied 
+                                    ? "bg-slate-900 text-white border border-slate-900" 
+                                    : "border border-slate-300 bg-white text-slate-800"
+                                }`}
+                              >
+                                <span className={`text-[9px] font-black leading-none ${isOccupied ? "text-white" : "text-slate-800"}`}>
+                                  {bedNum}
+                                </span>
+                                {isOccupied && (
+                                  <span className="text-[6px] font-bold truncate uppercase leading-none mt-0.5 text-white block">
+                                    {surnameText}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
                     </div>
                   </div>
 
-                  {/* Griglia Destra */}
-                  <div className="space-y-1">
-                    <span className="text-[8px] font-bold uppercase block text-center text-slate-500">Griglia Destra (65-109)</span>
-                    <div className="grid grid-cols-6 gap-1">
-                      {PEDANA_DESTRA_RIGHT.flatMap((row) => row).map((bedNum, idx) => {
-                        if (bedNum === null) return <div key={`print-pd-right-null-${idx}`} className="h-10 border border-transparent"></div>;
-                        const bList = bookingsToPrint.filter((b) => b.bedNumber === bedNum);
-                        return (
-                          <div key={`print-pd-right-${bedNum}`} className="border border-black p-0.5 text-center flex flex-col justify-between h-10 bg-white">
-                            <span className="text-[10px] font-black leading-none">{bedNum}</span>
-                            {bList.length > 0 ? (
-                              <div className="text-[6.5px] font-extrabold truncate uppercase leading-none text-slate-800">
-                                {bList.map((b) => (
-                                  <div key={b.id} className="truncate">
-                                    {b.slot === "morning" ? "M:" : b.slot === "afternoon" ? "P:" : "G:"}{b.customerName.split(" ")[0] || b.customerName}
-                                  </div>
-                                ))}
+                  {/* PEDANA DESTRA */}
+                  <div className="border border-slate-300 p-2.5 rounded-xl bg-white flex flex-col justify-between">
+                    <h3 className="text-[10px] font-black uppercase text-center mb-2 tracking-wider border-b border-slate-200 pb-0.5 text-slate-800">
+                      PEDANA DESTRA
+                    </h3>
+                    <div className="grid grid-cols-2 gap-3">
+                      {/* Griglia Sinistra */}
+                      <div className="space-y-1">
+                        <span className="text-[8px] font-bold uppercase block text-center text-slate-400">Griglia Sinistra (60-97)</span>
+                        <div className="grid grid-cols-5 gap-1">
+                          {PEDANA_DESTRA_LEFT.flatMap((row) => row).map((bedNum, idx) => {
+                            if (bedNum === null) return <div key={`print-pd-left-null-${idx}`} className="h-8 border border-transparent"></div>;
+                            const bList = bookings.filter((b) => b.bedNumber === bedNum);
+                            const surnameText = bList.map(b => {
+                              const parts = b.customerName.trim().split(/\s+/);
+                              return parts.length > 1 ? parts[parts.length - 1] : parts[0];
+                            }).join("/");
+                            const isOccupied = bList.length > 0;
+                            return (
+                              <div 
+                                key={`print-pd-left-${bedNum}`} 
+                                className={`p-0.5 text-center flex flex-col justify-center h-8 rounded ${
+                                  isOccupied 
+                                    ? "bg-slate-900 text-white border border-slate-900" 
+                                    : "border border-slate-300 bg-white text-slate-800"
+                                }`}
+                              >
+                                <span className={`text-[9px] font-black leading-none ${isOccupied ? "text-white" : "text-slate-800"}`}>
+                                  {bedNum}
+                                </span>
+                                {isOccupied && (
+                                  <span className="text-[6px] font-bold truncate uppercase leading-none mt-0.5 text-white block">
+                                    {surnameText}
+                                  </span>
+                                )}
                               </div>
-                            ) : (
-                              <span className="text-[6px] text-slate-300 font-medium tracking-tighter leading-none">LIBERO</span>
-                            )}
-                          </div>
-                        );
-                      })}
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Griglia Destra */}
+                      <div className="space-y-1">
+                        <span className="text-[8px] font-bold uppercase block text-center text-slate-400">Griglia Destra (65-109)</span>
+                        <div className="grid grid-cols-6 gap-1">
+                          {PEDANA_DESTRA_RIGHT.flatMap((row) => row).map((bedNum, idx) => {
+                            if (bedNum === null) return <div key={`print-pd-right-null-${idx}`} className="h-8 border border-transparent"></div>;
+                            const bList = bookings.filter((b) => b.bedNumber === bedNum);
+                            const surnameText = bList.map(b => {
+                              const parts = b.customerName.trim().split(/\s+/);
+                              return parts.length > 1 ? parts[parts.length - 1] : parts[0];
+                            }).join("/");
+                            const isOccupied = bList.length > 0;
+                            return (
+                              <div 
+                                key={`print-pd-right-${bedNum}`} 
+                                className={`p-0.5 text-center flex flex-col justify-center h-8 rounded ${
+                                  isOccupied 
+                                    ? "bg-slate-900 text-white border border-slate-900" 
+                                    : "border border-slate-300 bg-white text-slate-800"
+                                }`}
+                              >
+                                <span className={`text-[9px] font-black leading-none ${isOccupied ? "text-white" : "text-slate-800"}`}>
+                                  {bedNum}
+                                </span>
+                                {isOccupied && (
+                                  <span className="text-[6px] font-bold truncate uppercase leading-none mt-0.5 text-white block">
+                                    {surnameText}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
                     </div>
                   </div>
+                </div>
 
+                {/* Legenda ed Info */}
+                <div className="mt-4 border-t border-slate-200 pt-2 flex justify-between items-center text-[9px] text-slate-500 font-medium uppercase tracking-wider">
+                  <div className="flex gap-4 flex-row">
+                    <span className="flex items-center gap-1">
+                      <span className="w-2.5 h-2.5 border border-slate-900 bg-slate-900 rounded-sm"></span>
+                      <span className="text-slate-700 font-bold">Occupato (Cognome)</span>
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span className="w-2.5 h-2.5 border border-slate-300 bg-white rounded-sm"></span>
+                      <span className="text-slate-700 font-bold">Libero</span>
+                    </span>
+                  </div>
+                  <span>Totale Postazioni Occupate: {bookings.length} / Stampato il {new Date().toLocaleDateString("it-IT")}</span>
                 </div>
               </div>
-
-            </div>
             )}
 
-            {/* List Table underneath */}
-            {!printEmptyMap && !printEmptyList && (
-              <div className="mt-8 border-t border-black pt-4">
-              <h4 className="text-xs font-black uppercase mb-3 tracking-wider">REGISTRO ANALITICO PRENOTAZIONI ({bookings.length} POSIZIONI)</h4>
-              <table className="w-full text-left text-[9px] border-collapse border border-black">
-                <thead>
-                  <tr className="bg-slate-100 border-b border-black">
-                    <th className="py-1 px-2 border-r border-black font-extrabold w-12 text-center">LETTINO</th>
-                    <th className="py-1 px-2 border-r border-black font-extrabold">NOME CLIENTE</th>
-                    <th className="py-1 px-2 border-r border-black font-extrabold w-20 text-center">SLOT</th>
-                    <th className="py-1 px-2 border-r border-black font-extrabold w-16 text-center">TIPO</th>
-                    <th className="py-1 px-2 border-r border-black font-extrabold w-36">PAGATO (METODO)</th>
-                    <th className="py-1 px-2 border-r border-black font-extrabold w-20 text-right">DA PAGARE</th>
-                    <th className="py-1 px-2 font-extrabold">NOTE ED EVENTUALI DETTAGLI</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {bookings.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="py-4 text-center text-slate-400 italic">Nessun lettino occupato in data odierna.</td>
-                    </tr>
-                  ) : (
-                    [...bookings]
-                      .sort((a, b) => a.bedNumber - b.bedNumber)
-                      .map((b) => {
-                        const isSubscriber = b.customerType === "subscriber";
-                        const isHotel = b.isHotel;
-                        const bPayments = payments.filter((p) => p.bookingId === b.id);
-                        const totalPaid = bPayments.reduce((sum, p) => sum + p.amount, 0);
-                        const expected = isHotel ? 0 : getBookingPriceProportional(b, pricingConfigs, bedsConfig, rowsConfig);
-                        const remaining = Math.max(0, expected - totalPaid);
-                        
-                        const paymentDetails = isSubscriber 
-                          ? "-" 
-                          : isHotel
-                            ? "Hotel (non da saldare)"
-                            : bPayments.length > 0 
-                              ? bPayments.map((p) => {
-                                  const methodMap: Record<string, string> = {
-                                    cash: "Contanti",
-                                    pos: "POS",
-                                    bank: "Bonifico",
-                                    other: "Altro",
-                                    subscription: "Abbonamento"
-                                  };
-                                  return `${p.amount}€ (${methodMap[p.method] || p.method})`;
-                                }).join(", ")
-                              : "Nessuno";
-
-                        const daPagareText = isSubscriber || isHotel 
-                          ? "-" 
-                          : remaining === 0 
-                            ? "PAGATO" 
-                            : `${remaining.toFixed(2)}€`;
-
-                        const tipoLabel = isSubscriber ? "Abbonato" : isHotel ? "Hotel" : "Giornaliero";
-
-                        return (
-                          <tr key={b.id} className="border-b border-black/50 hover:bg-slate-50">
-                            <td className="py-1 px-2 border-r border-black font-extrabold text-center">{b.bedNumber}</td>
-                            <td className="py-1 px-2 border-r border-black font-bold uppercase">{b.customerName}</td>
-                            <td className="py-1 px-2 border-r border-black font-semibold uppercase text-center">{b.slot === "full_day" ? "Intero (G)" : b.slot === "morning" ? "Mattina (M)" : "Pomeriggio (P)"}</td>
-                            <td className="py-1 px-2 border-r border-black font-medium text-center">{tipoLabel}</td>
-                            <td className="py-1 px-2 border-r border-black font-medium text-slate-800">{paymentDetails}</td>
-                            <td className={`py-1 px-2 border-r border-black font-bold text-right ${remaining > 0 && !isSubscriber && !isHotel ? "text-red-600" : "text-emerald-700"}`}>
-                              {daPagareText}
-                            </td>
-                            <td className="py-1 px-2 text-slate-700">{b.notes || "-"}</td>
-                          </tr>
-                        );
-                      })
-                  )}
-                </tbody>
-              </table>
-            </div>
-            )}
-
-            {/* Footer */}
-            <div className="mt-8 pt-4 border-t border-black text-[8px] text-slate-400 flex justify-between uppercase tracking-wider font-semibold">
-              <span>Stampato il {new Date().toLocaleDateString("it-IT")}</span>
-              <span>Samarinda Beach Management System</span>
-            </div>
           </div>
         </div>
       )}

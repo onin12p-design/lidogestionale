@@ -11,13 +11,12 @@ import SubscriptionsModule from "./components/SubscriptionsModule";
 import CashierModule from "./components/CashierModule";
 import PricingModule from "./components/PricingModule";
 import ClientView from "./components/ClientView"; // Vista Cliente pubblica (C)
-import SorgentiModule from "./components/SorgentiModule";
-import AIAssistantWidget from "./components/AIAssistantWidget";
+import AIAssistantModule from "./components/AIAssistantModule";
 
 // Icons
-import { LayoutDashboard, QrCode, Users, Euro, Sparkles, Loader2, RefreshCw, Lock, LogOut, Globe, AlertTriangle, X, Folder } from "lucide-react";
+import { LayoutDashboard, QrCode, Users, Euro, Sparkles, Loader2, RefreshCw, Lock, LogOut, Globe, AlertTriangle, X, Folder, MessageSquare } from "lucide-react";
 
-type ActiveTab = "map" | "scanner" | "subscriptions" | "cashier" | "pricing" | "sorgenti";
+type ActiveTab = "map" | "scanner" | "subscriptions" | "cashier" | "pricing" | "assistant";
 
 export default function App() {
   const [currentDate, setCurrentDate] = useState<string>("");
@@ -51,7 +50,7 @@ export default function App() {
   const [pricingConfigs, setPricingConfigs] = useState<any[]>([]);
   const [bedsConfig, setBedsConfig] = useState<Record<number, number>>({});
   const [rowsConfig, setRowsConfig] = useState<Record<number, number>>({});
-  const [subscriptionSetup, setSubscriptionSetup] = useState<{ periods: any[], slotTypes: any[] }>({ periods: [], slotTypes: [] });
+  const [subscriptionSetup, setSubscriptionSetup] = useState<{ periods: any[], slotTypes: any[], prezzoMezzaGiornata?: number | null }>({ periods: [], slotTypes: [] });
   const [priceList, setPriceList] = useState<{ entries: any[] }>({ entries: [] });
   const [loadingData, setLoadingData] = useState(true);
   const [isOfflineMode, setIsOfflineMode] = useState(offlineModeState.active);
@@ -277,7 +276,8 @@ export default function App() {
         const data = docSnap.data();
         setSubscriptionSetup({
           periods: data.periods || [],
-          slotTypes: data.slotTypes || []
+          slotTypes: data.slotTypes || [],
+          prezzoMezzaGiornata: data.prezzoMezzaGiornata ?? null
         });
       } else {
         const defaultSetup = {
@@ -649,7 +649,7 @@ export default function App() {
               { id: "subscriptions", label: "Sezione Abbonati", icon: Users },
               { id: "cashier", label: "Cassa e Tab", icon: Euro },
               { id: "pricing", label: "Listino Prezzi", icon: Sparkles },
-              { id: "sorgenti", label: "Archivio Sorgenti", icon: Folder }
+              { id: "assistant", label: "Assistente AI", icon: MessageSquare }
             ].map((tab) => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
@@ -741,14 +741,11 @@ export default function App() {
           <PricingModule pricingConfigs={pricingConfigs} />
         )}
 
-        {activeTab === "sorgenti" && (
-          <SorgentiModule />
+        {activeTab === "assistant" && (
+          <AIAssistantModule />
         )}
 
       </main>
-
-      {/* FLOATING AI ASSISTANT WIDGET */}
-      <AIAssistantWidget />
 
       {/* 4. FOOTER */}
       <footer id="app-footer" className="bg-slate-100 border-t border-slate-200/50 py-4 text-center text-[10px] text-slate-400 px-4">

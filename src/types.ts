@@ -36,6 +36,7 @@ export interface Attendance {
   slot: BookingSlot;
   status: "present" | "absent";
   chargeLedgerId?: string; // reference to the daily_charge ledger entry
+  tipoGiornata?: "intera" | "mezza";
 }
 
 export interface Subscription {
@@ -58,6 +59,7 @@ export interface Subscription {
   createdAt?: string;
   pricingRule?: "standard" | "hotel_weekend";
   weekendRate?: number;
+  soloWeekend?: boolean;
 }
 
 export type BookingTipoPrenotazione = "mattina" | "pomeriggio" | "intera" | "abbonato";

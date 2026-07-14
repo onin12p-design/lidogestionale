@@ -649,17 +649,33 @@ app.post("/api/parse-scanner", upload.array("files"), async (req, res) => {
     const allExtractedItems: any[] = [];
     const errors: string[] = [];
 
+    // Fetch confirmed/active subscriptions to match
+    const subscriptionsRef = collection(db, "subscriptions");
+    const subsSnap = await getDocs(subscriptionsRef);
+    const allSubscriptions: any[] = [];
+    subsSnap.forEach((doc) => {
+      allSubscriptions.push({ id: doc.id, ...doc.data() });
+    });
+
     for (const file of files) {
       try {
         const isDocx = file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || 
                        file.originalname.toLowerCase().endsWith(".docx");
 
+        const meta = extractMetadata(file.originalname);
+        const { platform, date } = meta;
+
+        // Structured storage path
+        const relativeFolder = `${platform}/${date}`;
+        const filePath = `sorgenti/${relativeFolder}/${file.originalname}`;
+
+        let parsedItems: any[] = [];
+
         if (isDocx) {
           // Bypassing Gemini: use the fast, free, accurate deterministic parser
           console.log(`Deterministic parsing DOCX file: ${file.originalname}`);
           try {
-            const docxItems = await parseDocxDeterministic(file.buffer, file.originalname);
-            allExtractedItems.push(...docxItems);
+            parsedItems = await parseDocxDeterministic(file.buffer, file.originalname);
           } catch (docxErr: any) {
             console.error(`Errore nel parser DOCX per il file ${file.originalname}:`, docxErr);
             errors.push(`File ${file.originalname}: Errore di parsing deterministico: ${docxErr.message || String(docxErr)}`);
@@ -743,17 +759,7 @@ Restituisci solo un array di oggetti validi secondo la risposta strutturata JSON
             if (textResult) {
               const parsed = JSON.parse(textResult.trim());
               if (parsed && Array.isArray(parsed.items)) {
-                parsed.items.forEach((item: any) => {
-                  const num = Number(item.bedNumber);
-                  const isValid = VALID_BEDS.has(num);
-                  
-                  allExtractedItems.push({
-                    ...item,
-                    bedNumber: num,
-                    isValidBed: isValid,
-                    fileName: file.originalname
-                  });
-                });
+                parsedItems = parsed.items;
               }
             }
           } catch (geminiErr: any) {
@@ -761,6 +767,46 @@ Restituisci solo un array di oggetti validi secondo la risposta strutturata JSON
             errors.push(`File ${file.originalname}: Errore di analisi AI: ${geminiErr.message || String(geminiErr)}`);
           }
         }
+
+        // Processing & Matching
+        for (const item of parsedItems) {
+          const num = Number(item.bedNumber);
+          const isValid = VALID_BEDS.has(num);
+
+          const slotForDp = item.slot === "full_day" ? "both" : item.slot;
+          const presenceId = `${date}_${platform}_${num}_${slotForDp}`;
+
+          const { matchStatus, matchedSubscriptionId, matchedCustomerId } = matchPresenceToSubscription(num, date, item.customerName, allSubscriptions);
+
+          const presenceData: any = {
+            platform,
+            bedNumber: num,
+            date,
+            slot: slotForDp,
+            rawName: item.customerName,
+            parseConfidence: isAmbiguousName(item.customerName) ? "ambiguous" : "clean",
+            sourceStoragePath: filePath,
+            importedAt: new Date().toISOString(),
+            matchStatus
+          };
+
+          if (matchedSubscriptionId) presenceData.matchedSubscriptionId = matchedSubscriptionId;
+          if (matchedCustomerId) presenceData.matchedCustomerId = matchedCustomerId;
+
+          // Ingest into dailyPresences
+          await setDoc(doc(db, "dailyPresences", presenceId), presenceData);
+
+          allExtractedItems.push({
+            ...item,
+            bedNumber: num,
+            isValidBed: isValid,
+            fileName: file.originalname,
+            matchStatus,
+            matchedSubscriptionId,
+            matchedCustomerId
+          });
+        }
+
       } catch (err: any) {
         console.error("Errore generico nel ciclo file:", err);
         errors.push(`File ${file.originalname}: ${err.message || String(err)}`);
@@ -857,6 +903,137 @@ function isAmbiguousName(rawName: string): boolean {
   return false;
 }
 
+// Helper to normalize names for fuzzy matching (tolerant to accents, casing, spacing)
+function normalizeNameForMatching(name: string): string {
+  if (!name) return "";
+  return name
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]/g, "")
+    .trim();
+}
+
+// Shared helper function to match a daily presence to existing confirmed/active subscriptions
+function matchPresenceToSubscription(bedNumber: number, date: string, customerName: string, allSubscriptions: any[]) {
+  const matchingSubs = allSubscriptions.filter(sub => {
+    if (sub.status !== "confirmed" && sub.status !== "active") return false;
+    const bedMatches = sub.bedNumbers && sub.bedNumbers.some((b: any) => Number(b) === Number(bedNumber));
+    if (!bedMatches) return false;
+    return date >= sub.startDate && date <= sub.endDate;
+  });
+
+  let matchStatus: "matched" | "bed_period_match_name_mismatch" | "no_subscription" = "no_subscription";
+  let matchedSubscriptionId: string | undefined = undefined;
+  let matchedCustomerId: string | undefined = undefined;
+
+  if (matchingSubs.length > 0) {
+    const normRawName = normalizeNameForMatching(customerName);
+    
+    const matchedSub = matchingSubs.find(sub => {
+      const normSubName = normalizeNameForMatching(sub.customerName || "");
+      return normRawName === normSubName || normRawName.includes(normSubName) || normSubName.includes(normRawName);
+    });
+
+    if (matchedSub) {
+      matchStatus = "matched";
+      matchedSubscriptionId = matchedSub.id;
+      matchedCustomerId = matchedSub.customerId;
+    } else {
+      matchStatus = "bed_period_match_name_mismatch";
+    }
+  }
+
+  return { matchStatus, matchedSubscriptionId, matchedCustomerId };
+}
+
+// Shared helper to process an uploaded file, parse it if docx, and try to match presences to subscriptions
+async function processUploadedFile(file: Express.Multer.File, folder: string) {
+  const relativeFolder = folder.replace(/^sorgenti\//, "");
+  const filePath = `sorgenti/${relativeFolder}/${file.originalname}`;
+  
+  // 1. Create directory locally and write file (local fallback)
+  const localFolderDir = path.join(process.cwd(), "assets", "uploaded_sorgenti", relativeFolder);
+  await fsPromises.mkdir(localFolderDir, { recursive: true });
+  const localFilePath = path.join(localFolderDir, file.originalname);
+  await fsPromises.writeFile(localFilePath, file.buffer);
+
+  // 2. Upload to Firebase Storage
+  let downloadUrl = `/api/sorgenti/download?path=${encodeURIComponent(filePath)}`;
+  let storageSaveFailed = false;
+  try {
+    const storageRef = ref(storage, filePath);
+    const uploadResult = await uploadBytes(storageRef, file.buffer);
+    const realUrl = await getDownloadURL(uploadResult.ref);
+    if (realUrl) {
+      downloadUrl = realUrl;
+    }
+  } catch (storageErr: any) {
+    console.warn(`Firebase Storage upload failed, using local server fallback URL:`, storageErr.message || storageErr);
+    storageSaveFailed = true;
+  }
+
+  // 3. Save File metadata in Firestore 'sourceDocuments'
+  const docId = filePath.replace(/\//g, "_");
+  const fileMetadata = {
+    path: filePath,
+    name: file.originalname,
+    size: file.size,
+    downloadUrl,
+    uploadedAt: new Date().toISOString()
+  };
+  await setDoc(doc(db, "sourceDocuments", docId), fileMetadata);
+
+  // 4. Ingest parsed daily presences if .docx
+  let dailyPresencesCount = 0;
+  const isDocx = file.originalname.toLowerCase().endsWith(".docx");
+  if (isDocx) {
+    const parsedItems = await parseDocxDeterministic(file.buffer, file.originalname);
+    const { platform, date } = extractMetadata(`${relativeFolder}/${file.originalname}`);
+
+    // Fetch confirmed subscriptions to match
+    const subscriptionsRef = collection(db, "subscriptions");
+    const subsSnap = await getDocs(subscriptionsRef);
+    const allSubscriptions: any[] = [];
+    subsSnap.forEach((doc) => {
+      allSubscriptions.push({ id: doc.id, ...doc.data() });
+    });
+
+    for (const item of parsedItems) {
+      const slot = item.slot === "full_day" ? "both" : item.slot;
+      const presenceId = `${date}_${platform}_${item.bedNumber}_${slot}`;
+
+      // ---- PART C1: Matching automatico presenza ↔ abbonamento ----
+      const { matchStatus, matchedSubscriptionId, matchedCustomerId } = matchPresenceToSubscription(item.bedNumber, date, item.customerName, allSubscriptions);
+      
+      const presenceData: any = {
+        platform,
+        bedNumber: item.bedNumber,
+        date,
+        slot,
+        rawName: item.customerName,
+        parseConfidence: isAmbiguousName(item.customerName) ? "ambiguous" : "clean",
+        sourceStoragePath: filePath,
+        importedAt: new Date().toISOString(),
+        matchStatus
+      };
+
+      if (matchedSubscriptionId) presenceData.matchedSubscriptionId = matchedSubscriptionId;
+      if (matchedCustomerId) presenceData.matchedCustomerId = matchedCustomerId;
+
+      await setDoc(doc(db, "dailyPresences", presenceId), presenceData);
+      dailyPresencesCount++;
+    }
+  }
+
+  return {
+    fileMetadata,
+    dailyPresencesCount,
+    storageSaveFailed,
+    downloadUrl
+  };
+}
+
 // Upload endpoint for "Sorgenti"
 app.post("/api/sorgenti/upload", upload.array("files"), async (req, res) => {
   try {
@@ -873,93 +1050,110 @@ app.post("/api/sorgenti/upload", upload.array("files"), async (req, res) => {
     const uploadedFiles: any[] = [];
     const parseErrors: string[] = [];
     let dailyPresencesCount = 0;
+    let anyStorageSaveFailed = false;
 
     for (const file of files) {
       try {
-        const relativeFolder = folder.replace(/^sorgenti\//, "");
-        const filePath = `sorgenti/${relativeFolder}/${file.originalname}`;
-        
-        // 1. Create directory locally and write file (sandbox/container local persistence fallback)
-        const localFolderDir = path.join(process.cwd(), "assets", "uploaded_sorgenti", relativeFolder);
-        await fsPromises.mkdir(localFolderDir, { recursive: true });
-        const localFilePath = path.join(localFolderDir, file.originalname);
-        await fsPromises.writeFile(localFilePath, file.buffer);
-
-        // 2. Upload to Firebase Storage
-        let downloadUrl = `/api/sorgenti/download?path=${encodeURIComponent(filePath)}`;
-        try {
-          const storageRef = ref(storage, filePath);
-          const uploadResult = await uploadBytes(storageRef, file.buffer);
-          const realUrl = await getDownloadURL(uploadResult.ref);
-          if (realUrl) {
-            downloadUrl = realUrl;
-          }
-        } catch (storageErr: any) {
-          console.warn(`Firebase Storage upload failed, using local server fallback URL:`, storageErr.message || storageErr);
+        const result = await processUploadedFile(file, folder);
+        if (result.storageSaveFailed) {
+          anyStorageSaveFailed = true;
         }
-
-        // 3. Save File metadata in Firestore 'sourceDocuments'
-        const docId = filePath.replace(/\//g, "_");
-        const fileMetadata = {
-          path: filePath,
-          name: file.originalname,
-          size: file.size,
-          downloadUrl,
-          uploadedAt: new Date().toISOString()
-        };
-        await setDoc(doc(db, "sourceDocuments", docId), fileMetadata);
-
-        // 4. Ingest parsed daily presences if .docx
-        const isDocx = file.originalname.toLowerCase().endsWith(".docx");
-        if (isDocx) {
-          const parsedItems = await parseDocxDeterministic(file.buffer, file.originalname);
-          const { platform, date } = extractMetadata(`${relativeFolder}/${file.originalname}`);
-
-          for (const item of parsedItems) {
-            // Determine correct slot mapping (full_day -> both)
-            const slot = item.slot === "full_day" ? "both" : item.slot;
-            
-            // Build unique deterministic presence ID to prevent duplicate imports
-            const presenceId = `${date}_${platform}_${item.bedNumber}_${slot}`;
-            
-            const presenceData = {
-              platform,
-              bedNumber: item.bedNumber,
-              date,
-              slot,
-              rawName: item.customerName,
-              parseConfidence: isAmbiguousName(item.customerName) ? "ambiguous" : "clean",
-              sourceStoragePath: filePath,
-              importedAt: new Date().toISOString()
-            };
-
-            await setDoc(doc(db, "dailyPresences", presenceId), presenceData);
-            dailyPresencesCount++;
-          }
-        }
-
         uploadedFiles.push({
           name: file.originalname,
-          path: filePath,
-          downloadUrl
+          path: result.fileMetadata.path,
+          downloadUrl: result.downloadUrl
         });
-
+        dailyPresencesCount += result.dailyPresencesCount;
       } catch (err: any) {
         console.error(`Errore nel caricamento del file ${file.originalname}:`, err);
         parseErrors.push(`File ${file.originalname}: ${err.message || String(err)}`);
       }
     }
 
-    res.json({
-      success: true,
-      files: uploadedFiles,
-      dailyPresencesImported: dailyPresencesCount,
-      errors: parseErrors.length > 0 ? parseErrors : null
-    });
+    if (anyStorageSaveFailed) {
+      res.json({
+        success: false,
+        storageSaveFailed: true,
+        files: uploadedFiles,
+        dailyPresencesImported: dailyPresencesCount,
+        errors: parseErrors.length > 0 ? parseErrors : null,
+        error: "Salvataggio permanente fallito: 1 o più file NON sono stati archiviati in modo definitivo su Firebase Storage."
+      });
+    } else {
+      res.json({
+        success: true,
+        files: uploadedFiles,
+        dailyPresencesImported: dailyPresencesCount,
+        errors: parseErrors.length > 0 ? parseErrors : null
+      });
+    }
 
   } catch (err: any) {
     console.error("Errore nell'endpoint /api/sorgenti/upload:", err);
     res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// Direct Upload and Ingest endpoint for Chat panel
+app.post("/api/ai-assistant/upload-and-ingest", upload.single("file"), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) {
+      res.status(400).json({ success: false, error: "Nessun file fornito." });
+      return;
+    }
+
+    await ensureServerAuth();
+
+    const meta = extractMetadata(file.originalname);
+    let month = "luglio";
+    const lowerName = file.originalname.toLowerCase();
+    if (lowerName.includes("giugno")) month = "giugno";
+    else if (lowerName.includes("agosto")) month = "agosto";
+    else if (lowerName.includes("settembre")) month = "settembre";
+    const folder = `${meta.platform}/${month}`;
+
+    const result = await processUploadedFile(file, folder);
+
+    let ambiguousCount = 0;
+    let cleanCount = 0;
+    if (file.originalname.toLowerCase().endsWith(".docx")) {
+      const presRef = collection(db, "dailyPresences");
+      const presSnap = await getDocs(presRef);
+      presSnap.forEach((doc) => {
+        const data = doc.data();
+        if (data.date === meta.date && data.platform === meta.platform) {
+          if (data.parseConfidence === "ambiguous") {
+            ambiguousCount++;
+          } else {
+            cleanCount++;
+          }
+        }
+      });
+    }
+
+    res.json({
+      success: !result.storageSaveFailed,
+      storageSaveFailed: result.storageSaveFailed,
+      file: {
+        name: file.originalname,
+        size: file.size,
+        path: result.fileMetadata.path,
+        downloadUrl: result.downloadUrl
+      },
+      metadata: {
+        platform: meta.platform,
+        date: meta.date,
+        folder
+      },
+      dailyPresencesImported: result.dailyPresencesCount,
+      ambiguousCount,
+      cleanCount,
+      error: result.storageSaveFailed ? "Salvataggio permanente fallito su Firebase Storage. Verificare l'inizializzazione del bucket." : undefined
+    });
+  } catch (err: any) {
+    console.error("Errore nell'endpoint /api/ai-assistant/upload-and-ingest:", err);
+    res.status(500).json({ success: false, error: err.message || String(err) });
   }
 });
 
@@ -1182,6 +1376,72 @@ const getOriginalExcelDeclaration = {
   }
 };
 
+const getAvailabilityDeclaration = {
+  name: "getAvailability",
+  description: "Ritorna lo stato live della disponibilità dei lettini per una determinata data, indicando quali lettini sono liberi, quali occupati (con nome cliente e tipo: abbonato o giornaliero), e i conteggi totali.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      date: { type: Type.STRING, description: "Data da controllare in formato YYYY-MM-DD" },
+      platform: { type: Type.STRING, description: "Pedana opzionale per filtrare i lettini: 'sx' o 'dx'" }
+    },
+    required: ["date"]
+  }
+};
+
+// Tool implementation for getAvailability
+async function getAvailability(date: string, platform?: "sx" | "dx") {
+  const bookingsQuery = query(collection(db, "bookings"), where("date", "==", date));
+  const snapshot = await getDocs(bookingsQuery);
+  const occupiedBedsMap = new Map<number, any>();
+  
+  snapshot.forEach((docSnap) => {
+    const data = docSnap.data();
+    const bedNum = Number(data.bedNumber);
+    occupiedBedsMap.set(bedNum, {
+      customerName: data.customerName || "Sconosciuto",
+      customerType: data.customerType || "daily"
+    });
+  });
+
+  const bedsToCheck = Array.from(VALID_BEDS).filter((bedNum) => {
+    if (!platform) return true;
+    const isLeft = bedNum <= 34;
+    const isRight = bedNum >= 60;
+    if (platform === "sx") return isLeft;
+    if (platform === "dx") return isRight;
+    return true;
+  });
+
+  const occupied: any[] = [];
+  const free: number[] = [];
+
+  for (const bedNum of bedsToCheck) {
+    if (occupiedBedsMap.has(bedNum)) {
+      const info = occupiedBedsMap.get(bedNum);
+      occupied.push({
+        bedNumber: bedNum,
+        customerName: info.customerName,
+        customerType: info.customerType === "abbonato" || info.customerType === "seasonal" ? "abbonato" : "giornaliero"
+      });
+    } else {
+      free.push(bedNum);
+    }
+  }
+
+  return {
+    date,
+    platform: platform || "entrambe",
+    totalValidBeds: bedsToCheck.length,
+    counts: {
+      occupied: occupied.length,
+      free: free.length
+    },
+    occupiedList: occupied,
+    freeList: free
+  };
+}
+
 const proposeSubscriptionCardDeclaration = {
   name: "proposeSubscriptionCard",
   description: "Propone la creazione di una scheda abbonamento (bozza) modificabile sul frontend.",
@@ -1249,29 +1509,33 @@ app.post("/api/ai-assistant", async (req, res) => {
     const msgsSnap = await getDocs(msgsRef);
     const history: any[] = [];
     msgsSnap.forEach((docSnap) => {
-      history.push(docSnap.data());
+      history.push({ id: docSnap.id, ...docSnap.data() });
     });
     history.sort((a, b) => (a.timestamp > b.timestamp ? 1 : -1));
 
-    // Limit history to keep tokens reasonable (last 16 messages)
-    const recentHistory = history.slice(-16);
+    // Keep up to 40 previous messages to ensure long-term memory without exceeding token limit
+    const recentHistory = history.slice(-40);
 
-    // Build the message stream for Gemini
+    // Build the message stream for Gemini, preserving structured parts if they exist
     const geminiContents: any[] = recentHistory.map((m) => {
+      const role = m.role === "assistant" ? "model" : m.role;
       return {
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content || "" }] as any[]
+        role: role,
+        parts: m.parts || [{ text: m.content || "" }] as any[]
       };
     });
 
     // Add current user message
+    const userParts = [{ text: message }];
     geminiContents.push({
       role: "user",
-      parts: [{ text: message }] as any[]
+      parts: userParts as any[]
     });
 
     const systemInstruction = `Sei l'Assistente AI del lido 'Samarinda' inserito nel gestionale.
-Il tuo ruolo è aiutare la reception a consultare le presenze storiche del lido, gli abbonamenti e l'anagrafica clienti, e a formulare nuove prenotazioni.
+Il tuo ruolo è quello di un assistente virtuale vero e proprio: conversa in modo amichevole, rispondi con calore e professionalità, discuti opzioni, risolvi dubbi teorici e spiega i dati in modo chiaro e discorsivo.
+Non sei costretto ad eseguire sempre una chiamata a uno strumento (tool call): se la domanda dell'utente è generica, di follow-up, una richiesta di spiegazione, un consiglio gestionale (es. 'conviene alzare i prezzi?', 'come posso riorganizzare?'), rispondi direttamente in linguaggio naturale in modo discorsivo ed elegante, senza inventare dati ma discutendo in modo intelligente.
+Usa gli strumenti (tool) SOLO quando l'utente ti chiede esplicitamente di effettuare un'azione reale o ha bisogno di recuperare informazioni reali dal sistema (es. cercare presenze storiche, verificare disponibilità lettini in una certa data, cercare abbonamenti, o proporre schede di prenotazione/abbonamento).
 
 Dettagli importanti sul lido Samarinda:
 - Bed totale del lido = 84 lettini validi in totale (34 pedana sinistra + 50 pedana destra). Non dire che ci sono 109 lettini in totale, anche se i numeri di lettino vanno da 1 a 109 con gap intermedi.
@@ -1286,6 +1550,7 @@ Le tue capacità:
 4. Fornire link di download ai documenti originali con 'getSourceDocument' e 'getOriginalExcel'.
 5. Proporre la creazione di un abbonamento con 'proposeSubscriptionCard'.
 6. Proporre una prenotazione giornaliera con 'proposeDailyMapEntry'.
+7. Controllare lo stato live della disponibilità dei lettini liberi e occupati in una certa data usando 'getAvailability'.
 
 REGOLA DI SICUREZZA ASSOLUTA:
 Non puoi scrivere direttamente nel database le prenotazioni o abbonamenti. Puoi solo PROPORRE schede o inserimenti usando i relativi tool (proposeSubscriptionCard o proposeDailyMapEntry).
@@ -1304,6 +1569,7 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
           searchCustomersDeclaration,
           getSourceDocumentDeclaration,
           getOriginalExcelDeclaration,
+          getAvailabilityDeclaration,
           proposeSubscriptionCardDeclaration,
           proposeDailyMapEntryDeclaration
         ]
@@ -1312,6 +1578,15 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
 
     // 2. Execute multi-turn tool calling loop
     let currentContents = [...geminiContents];
+    const newTurnsToSave: { role: string; parts: any[]; content?: string; proposals?: any[] }[] = [];
+
+    // Track the initial user message
+    newTurnsToSave.push({
+      role: "user",
+      parts: userParts,
+      content: message
+    });
+
     let response = await generateContentWithRetry(ai, {
       model: "gemini-3.5-flash",
       contents: currentContents,
@@ -1336,10 +1611,12 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
         }
       }));
 
-      currentContents.push({
+      const modelTurn = {
         role: "model",
         parts: modelParts
-      });
+      };
+      currentContents.push(modelTurn);
+      newTurnsToSave.push(modelTurn);
 
       const toolResponseParts: any[] = [];
 
@@ -1364,6 +1641,8 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
             resultData = await getSourceDocument(args.platform, args.date);
           } else if (toolName === "getOriginalExcel") {
             resultData = await getOriginalExcel();
+          } else if (toolName === "getAvailability") {
+            resultData = await getAvailability(args.date, args.platform);
           } else if (toolName === "proposeSubscriptionCard") {
             resultData = { status: "proposed_to_user", args };
             allProposals.push({ type: "subscription", id: toolCallId || `prop_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`, data: args });
@@ -1387,10 +1666,12 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
         });
       }
 
-      currentContents.push({
+      const userTurn = {
         role: "user",
         parts: toolResponseParts
-      });
+      };
+      currentContents.push(userTurn);
+      newTurnsToSave.push(userTurn);
 
       response = await generateContentWithRetry(ai, {
         model: "gemini-3.5-flash",
@@ -1403,23 +1684,30 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
     }
 
     const textBlocks = response.text || "";
-
-    // 3. Persist the interaction to Firestore
-    const userMsgId = `user_${Date.now()}`;
-    await setDoc(doc(db, "assistantSessions", sessionId, "messages", userMsgId), {
-      role: "user",
-      content: message,
-      timestamp: new Date().toISOString()
-    });
-
-    const assistantMsgId = `assistant_${Date.now()}`;
-    const assistantMessageData = {
+    const assistantParts = [{ text: textBlocks }];
+    const assistantTurn: any = {
       role: "assistant",
-      content: textBlocks,
-      proposals: allProposals,
-      timestamp: new Date().toISOString()
+      parts: assistantParts,
+      content: textBlocks
     };
-    await setDoc(doc(db, "assistantSessions", sessionId, "messages", assistantMsgId), assistantMessageData);
+    if (allProposals.length > 0) {
+      assistantTurn.proposals = allProposals;
+    }
+    newTurnsToSave.push(assistantTurn);
+
+    // Save all turns sequentially to Firestore
+    const baseTime = Date.now();
+    for (let i = 0; i < newTurnsToSave.length; i++) {
+      const turn = newTurnsToSave[i];
+      const msgId = `${turn.role}_${baseTime}_${i}`;
+      await setDoc(doc(db, "assistantSessions", sessionId, "messages", msgId), {
+        role: turn.role,
+        parts: turn.parts,
+        content: turn.content || "",
+        proposals: turn.proposals || null,
+        timestamp: new Date(baseTime + i * 10).toISOString()
+      });
+    }
 
     res.json({
       success: true,

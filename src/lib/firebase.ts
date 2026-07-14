@@ -506,7 +506,7 @@ export function onSnapshot(
           // Cache state locally (write-through)
           const parsed = parsePath(path);
           if (parsed.isDoc) {
-            if (snapshot.exists()) {
+            if (typeof snapshot.exists === "function" && snapshot.exists()) {
               setLocalDoc(parsed.collection, parsed.docId!, snapshot.data());
             }
           } else {

@@ -20,6 +20,9 @@ interface ExtractedItem {
   isValidBed: boolean;
   fileName?: string;
   importAction: "overwrite" | "skip" | "create";
+  matchedSubscriptionId?: string;
+  matchedCustomerId?: string;
+  matchStatus?: string;
 }
 
 export default function ScannerModule({ currentDate, existingBookings, onImportComplete }: ScannerModuleProps) {
@@ -73,12 +76,15 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
             id: `extracted-${Date.now()}-${index}`,
             bedNumber: bedNum,
             customerName: item.customerName || "Cliente",
-            customerType: item.customerType || "daily",
+            customerType: item.matchStatus === "matched" ? "subscriber" : (item.customerType || "daily"),
             slot: item.slot || "full_day",
             notes: item.notes || "",
             isValidBed: isValid,
             fileName: item.fileName,
-            importAction: conflict ? "skip" : "create"
+            importAction: conflict ? "skip" : "create",
+            matchedSubscriptionId: item.matchedSubscriptionId,
+            matchedCustomerId: item.matchedCustomerId,
+            matchStatus: item.matchStatus
           };
         });
 
@@ -189,14 +195,15 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
             }
           }
 
-          // Create the booking document via transaction without creating a customer document
+          // Create the booking document via transaction, linking the matched customer/subscription if present
           const bookingData = sanitizeForFirestore({
             bedNumber: item.bedNumber,
             date: currentDate,
             slot: item.slot,
-            customerId: "", // Scanner bookings have no associated customer card
+            customerId: item.matchedCustomerId || "", 
             customerName: item.customerName,
             customerType: item.customerType,
+            subscriptionId: item.matchedSubscriptionId || "",
             source: "scanner" as const,
             notes: item.notes || ""
           });

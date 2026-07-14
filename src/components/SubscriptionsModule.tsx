@@ -1,9 +1,11 @@
 import React, { useState, useEffect } from "react";
-import { db, createBookingTransactional, collection, doc, setDoc, deleteDoc, addDoc, writeBatch } from "../lib/firebase";
+import { db, createBookingTransactional, collection, doc, setDoc, deleteDoc, addDoc, writeBatch, onSnapshot, runTransaction, getDocs, query, where } from "../lib/firebase";
 import { 
   getRomeTodayString, 
   formatItalianDate, 
-  sanitizeForFirestore 
+  sanitizeForFirestore,
+  getBedLettiniCount,
+  getBedItems
 } from "../utils";
 import { 
   Subscription, 
@@ -37,8 +39,11 @@ import {
   Info,
   CalendarDays,
   UserPlus,
-  Settings
+  Settings,
+  Printer
 } from "lucide-react";
+import { jsPDF } from "jspdf";
+import autoTable from "jspdf-autotable";
 
 interface SubscriptionsModuleProps {
   subscriptions: Subscription[];
@@ -50,7 +55,7 @@ interface SubscriptionsModuleProps {
   bedsConfig: Record<number, number>;
   rowsConfig: Record<number, number>;
   pricingConfigs: any[];
-  subscriptionSetup?: { periods: any[], slotTypes: any[] };
+  subscriptionSetup?: { periods: any[], slotTypes: any[], prezzoMezzaGiornata?: number | null };
   priceList?: { entries: any[] };
   onRefresh?: () => void;
   preSelectedSubId?: string | null;
@@ -96,6 +101,7 @@ export default function SubscriptionsModule({
   const [newPeriodPrice, setNewPeriodPrice] = useState(0);
   const [newPeriodPricingRule, setNewPeriodPricingRule] = useState<"standard" | "hotel_weekend">("standard");
   const [newPeriodWeekendRate, setNewPeriodWeekendRate] = useState(25);
+  const [newPeriodSoloWeekend, setNewPeriodSoloWeekend] = useState(false);
 
   // Omonimo / Homonyms states
   const [showOmonimoModal, setShowOmonimoModal] = useState(false);
@@ -130,6 +136,20 @@ export default function SubscriptionsModule({
   const [jsonText, setJsonText] = useState("");
   const [importStatus, setImportStatus] = useState<string | null>(null);
 
+  // Print Subscribers Modal State
+  const [showPrintModal, setShowPrintModal] = useState(false);
+  const [printStartDate, setPrintStartDate] = useState("2026-06-01");
+  const [printEndDate, setPrintEndDate] = useState("2026-09-15");
+  const [printPedana, setPrintPedana] = useState<"sinistra" | "destra" | "entrambe">("entrambe");
+
+  // Bulk Import Modal State
+  const [showBulkImportModal, setShowBulkImportModal] = useState(false);
+  const [bulkInputText, setBulkInputText] = useState("");
+  const [parsedRows, setParsedRows] = useState<any[]>([]);
+  const [parsingErrors, setParsingErrors] = useState<string[]>([]);
+  const [isImporting, setIsImporting] = useState(false);
+  const [ignoreConflicts, setIgnoreConflicts] = useState(false);
+
   // Edit Ledger Entry Modal State
   const [showEditLedgerModal, setShowEditLedgerModal] = useState(false);
   const [editLedgerEntry, setEditLedgerEntry] = useState<LedgerEntry | null>(null);
@@ -157,6 +177,27 @@ export default function SubscriptionsModule({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [configHalfDayPrice, setConfigHalfDayPrice] = useState<number | "">("");
+
+  // Bonifica states
+  const [showBonificaModal, setShowBonificaModal] = useState(false);
+  const [orphanBookings, setOrphanBookings] = useState<any[]>([]);
+  const [loadingOrphans, setLoadingOrphans] = useState(false);
+
+  // Daily Presences state & onSnapshot loader
+  const [dailyPresences, setDailyPresences] = useState<any[]>([]);
+
+  useEffect(() => {
+    const colRef = collection(db, "dailyPresences");
+    const unsubscribe = onSnapshot(colRef, (snapshot: any) => {
+      const list: any[] = [];
+      snapshot.forEach((docSnap: any) => {
+        list.push({ id: docSnap.id, ...docSnap.data() });
+      });
+      setDailyPresences(list);
+    });
+    return unsubscribe;
+  }, []);
 
   // Setup Abbonamenti / Dynamic Pricing states
   const [newPeriodId, setNewPeriodId] = useState("");
@@ -283,9 +324,24 @@ export default function SubscriptionsModule({
     startDate: string,
     endDate: string,
     slot: BookingSlot,
-    excludeSubId?: string
+    excludeSubId?: string,
+    soloWeekend?: boolean
   ) => {
-    const dates = getDatesInRange(startDate, endDate);
+    let dates = getDatesInRange(startDate, endDate);
+    if (soloWeekend) {
+      dates = dates.filter((d) => {
+        const parts = d.split("-");
+        if (parts.length === 3) {
+          const year = Number(parts[0]);
+          const month = Number(parts[1]) - 1;
+          const day = Number(parts[2]);
+          const dateObj = new Date(year, month, day);
+          const dayOfWeek = dateObj.getDay();
+          return dayOfWeek === 0 || dayOfWeek === 6;
+        }
+        return false;
+      });
+    }
     const conflicts: { id?: string; date: string; bedNumber: number; slot: string; customer: string }[] = [];
 
     dates.forEach((dt) => {
@@ -399,8 +455,15 @@ export default function SubscriptionsModule({
       }
       setNewPeriodPriceMode("listino");
       setNewPeriodAgreedPrice("");
+      setNewPeriodSoloWeekend(false);
     }
   }, [showAddPeriodModal, subscriptionSetup]);
+
+  useEffect(() => {
+    if (subscriptionSetup && subscriptionSetup.prezzoMezzaGiornata !== undefined && subscriptionSetup.prezzoMezzaGiornata !== null) {
+      setConfigHalfDayPrice(subscriptionSetup.prezzoMezzaGiornata);
+    }
+  }, [subscriptionSetup]);
 
   useEffect(() => {
     if (newPeriodPriceMode === "listino") {
@@ -419,6 +482,399 @@ export default function SubscriptionsModule({
       setNewPeriodPrice(0);
     }
   }, [newPeriodPriceMode, newPeriodId, newPeriodSlotTypeId, newPeriodAgreedPrice, priceList]);
+
+  const handleAnalyzeBulk = () => {
+    setParsingErrors([]);
+    setParsedRows([]);
+    setIgnoreConflicts(false);
+    
+    if (!bulkInputText.trim()) {
+      setParsingErrors(["L'input non può essere vuoto."]);
+      return;
+    }
+
+    const lines = bulkInputText.split("\n");
+    const tempRows: any[] = [];
+    const errors: string[] = [];
+
+    // To check conflict with other items being imported in the SAME batch:
+    const tempImported: { bedNumber: number; startDate: string; endDate: string; lineNum: number }[] = [];
+
+    lines.forEach((line, index) => {
+      const lineNum = index + 1;
+      const cleanLine = line.trim();
+      if (!cleanLine) return; // skip empty lines
+
+      const parts = cleanLine.split("|");
+      if (parts.length !== 4) {
+        errors.push(`Riga ${lineNum}: Formato non valido. Deve essere: Nome | Letto | DataInizio | DataFine`);
+        return;
+      }
+
+      const name = parts[0].trim();
+      const bedStr = parts[1].trim();
+      const startStr = parts[2].trim();
+      const endStr = parts[3].trim();
+
+      if (!name) {
+        errors.push(`Riga ${lineNum}: Il nome cliente non può essere vuoto.`);
+        return;
+      }
+
+      const bedNum = Number(bedStr);
+      if (isNaN(bedNum) || bedNum <= 0) {
+        errors.push(`Riga ${lineNum}: Numero letto '${bedStr}' non valido. Deve essere un numero intero positivo.`);
+        return;
+      }
+
+      // Date validation
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+      if (!dateRegex.test(startStr)) {
+        errors.push(`Riga ${lineNum}: Formato DataInizio '${startStr}' non valido. Deve essere YYYY-MM-DD.`);
+        return;
+      }
+      if (!dateRegex.test(endStr)) {
+        errors.push(`Riga ${lineNum}: Formato DataFine '${endStr}' non valido. Deve essere YYYY-MM-DD.`);
+        return;
+      }
+
+      const startTime = Date.parse(startStr);
+      const endTime = Date.parse(endStr);
+      if (isNaN(startTime)) {
+        errors.push(`Riga ${lineNum}: DataInizio '${startStr}' non valida.`);
+        return;
+      }
+      if (isNaN(endTime)) {
+        errors.push(`Riga ${lineNum}: DataFine '${endStr}' non valida.`);
+        return;
+      }
+
+      if (startStr > endStr) {
+        errors.push(`Riga ${lineNum}: La data inizio (${startStr}) non può essere successiva alla data fine (${endStr}).`);
+        return;
+      }
+
+      // Check if customer exists
+      const nameLower = name.toLowerCase().trim();
+      const existsInCustomers = customers.some(
+        (c) => c.name.toLowerCase().trim() === nameLower
+      );
+      const existsInSameBatch = tempRows.some(
+        (r) => r.customerName.toLowerCase().trim() === nameLower
+      );
+      const status = (existsInCustomers || existsInSameBatch) ? "Cliente esistente" : "Nuovo cliente";
+
+      // Check conflict:
+      // 1. With existing active subscriptions in Firestore
+      let conflict = false;
+      let conflictReason = "";
+
+      const overlappingSub = subscriptions.find((s) => {
+        if (s.status === "cancelled") return false;
+        const datesOverlap = s.startDate <= endStr && s.endDate >= startStr;
+        const bedMatch = s.bedNumbers.includes(bedNum);
+        return datesOverlap && bedMatch;
+      });
+
+      if (overlappingSub) {
+        conflict = true;
+        conflictReason = `Letto già occupato da ${overlappingSub.customerName} (${overlappingSub.startDate} a ${overlappingSub.endDate})`;
+      } else {
+        // 2. With other rows in the same import
+        const sameBatchConflict = tempImported.find((item) => {
+          const datesOverlap = item.startDate <= endStr && item.endDate >= startStr;
+          const bedMatch = item.bedNumber === bedNum;
+          return datesOverlap && bedMatch;
+        });
+
+        if (sameBatchConflict) {
+          conflict = true;
+          conflictReason = `Conflitto interno nella riga ${sameBatchConflict.lineNum} con lo stesso letto ${bedNum} nel periodo ${sameBatchConflict.startDate} a ${sameBatchConflict.endDate}`;
+        }
+      }
+
+      tempImported.push({
+        bedNumber: bedNum,
+        startDate: startStr,
+        endDate: endStr,
+        lineNum,
+      });
+
+      tempRows.push({
+        lineNum,
+        customerName: name,
+        bedNumber: bedNum,
+        startDate: startStr,
+        endDate: endStr,
+        status,
+        conflict,
+        conflictReason,
+      });
+    });
+
+    if (errors.length > 0) {
+      setParsingErrors(errors);
+      setParsedRows([]);
+    } else {
+      setParsedRows(tempRows);
+    }
+  };
+
+  const handleConfirmBulkImport = async () => {
+    if (parsedRows.length === 0) return;
+
+    const hasConflicts = parsedRows.some((r) => r.conflict);
+    if (hasConflicts && !ignoreConflicts) {
+      setErrorMessage("Risolvi i conflitti o seleziona 'Importa comunque ignorando i conflitti' per procedere.");
+      return;
+    }
+
+    setIsImporting(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    try {
+      await runTransaction(db, async (tx) => {
+        const localNewCustomersMap: { [nameLower: string]: string } = {};
+
+        for (const row of parsedRows) {
+          const nameLower = row.customerName.toLowerCase().trim();
+          let customerId = "";
+
+          const existingCust = customers.find(
+            (c) => c.name.toLowerCase().trim() === nameLower
+          );
+
+          if (existingCust) {
+            customerId = existingCust.id!;
+          } else if (localNewCustomersMap[nameLower]) {
+            customerId = localNewCustomersMap[nameLower];
+          } else {
+            const newId = `customer_${Math.random().toString(36).substring(2, 11)}`;
+            const customerRef = doc(db, `customers/${newId}`);
+            customerId = newId;
+            localNewCustomersMap[nameLower] = newId;
+
+            const customerData = sanitizeForFirestore({
+              name: row.customerName.trim(),
+              phone: "",
+              notes: "Creato tramite Importazione Massiva",
+              type: "subscriber",
+            });
+
+            tx.set(customerRef, customerData);
+          }
+
+          const subId = `sub_bulk_${Math.random().toString(36).substring(2, 11)}`;
+          const subRef = doc(db, `subscriptions/${subId}`);
+
+          const subscriptionData = sanitizeForFirestore({
+            customerId,
+            customerName: row.customerName.trim(),
+            customerPhone: "",
+            bedNumbers: [row.bedNumber],
+            startDate: row.startDate,
+            endDate: row.endDate,
+            slot: "full_day",
+            daysOfWeek: [1, 2, 3, 4, 5, 6, 7],
+            priceTotal: 0,
+            priceMode: "da_concordare",
+            agreedPrice: null,
+            status: "active",
+            notes: "Importazione Massiva",
+            createdAt: new Date().toISOString()
+          });
+
+          tx.set(subRef, subscriptionData);
+        }
+      });
+
+      setSuccessMessage(`Importazione completata con successo! Inseriti ${parsedRows.length} abbonamenti.`);
+      setShowBulkImportModal(false);
+      setBulkInputText("");
+      setParsedRows([]);
+      setParsingErrors([]);
+    } catch (err: any) {
+      console.error("Errore durante l'importazione massiva:", err);
+      setErrorMessage(`Errore durante l'importazione: ${err.message || String(err)}`);
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handleGeneratePDF = () => {
+    const formatDateDM = (dateStr: string) => {
+      if (!dateStr) return "";
+      const parts = dateStr.split("-");
+      if (parts.length === 3) {
+        return `${parts[2]}/${parts[1]}`;
+      }
+      return dateStr;
+    };
+
+    const formatDateFull = (dateStr: string) => {
+      if (!dateStr) return "";
+      const parts = dateStr.split("-");
+      if (parts.length === 3) {
+        return `${parts[2]}/${parts[1]}/${parts[0]}`;
+      }
+      return dateStr;
+    };
+
+    const getFormattedNow = () => {
+      const now = new Date();
+      const day = String(now.getDate()).padStart(2, "0");
+      const month = String(now.getMonth() + 1).padStart(2, "0");
+      const year = now.getFullYear();
+      const hours = String(now.getHours()).padStart(2, "0");
+      const minutes = String(now.getMinutes()).padStart(2, "0");
+      return `${day}/${month}/${year} ${hours}:${minutes}`;
+    };
+
+    // Map to group active subscriptions by customerId (fallback to customerName)
+    const customerGroups = new Map<string, {
+      customerName: string;
+      subs: Subscription[];
+    }>();
+
+    subscriptions.forEach((sub) => {
+      // 1. Only active status
+      if (sub.status !== "active") return;
+
+      // 2. Overlap dates filter
+      const overlaps = sub.startDate <= printEndDate && sub.endDate >= printStartDate;
+      if (!overlaps) return;
+
+      // 3. Pedana filter
+      let matchesPedana = false;
+      if (printPedana === "entrambe") {
+        matchesPedana = true;
+      } else {
+        matchesPedana = sub.bedNumbers.some((bNum) => {
+          if (printPedana === "sinistra" && bNum <= 34) return true;
+          if (printPedana === "destra" && bNum >= 60) return true;
+          return false;
+        });
+      }
+      if (!matchesPedana) return;
+
+      const cId = sub.customerId || sub.customerName || "sconosciuto";
+      if (!customerGroups.has(cId)) {
+        customerGroups.set(cId, {
+          customerName: sub.customerName || "Cliente",
+          subs: []
+        });
+      }
+      customerGroups.get(cId)!.subs.push(sub);
+    });
+
+    let grandTotal = 0;
+    let clientsCount = 0;
+
+    // Sort by Customer Name (alphabetically)
+    const sortedGroups = Array.from(customerGroups.values()).sort((a, b) => 
+      a.customerName.localeCompare(b.customerName, "it", { sensitivity: "base" })
+    );
+
+    const tableBody = sortedGroups.map((group) => {
+      clientsCount++;
+
+      // Union of bedNumbers, filtered by selected pedana, sorted
+      const bedNumbersSet = new Set<number>();
+      group.subs.forEach(s => {
+        s.bedNumbers.forEach(bNum => {
+          if (printPedana === "sinistra" && bNum > 34) return;
+          if (printPedana === "destra" && bNum < 60) return;
+          bedNumbersSet.add(bNum);
+        });
+      });
+      const sortedBeds = Array.from(bedNumbersSet).sort((a, b) => a - b);
+      const bedNumbersStr = sortedBeds.join(", ");
+
+      // Periods of their cards, listed
+      const periodStrings = group.subs.map(s => `${formatDateDM(s.startDate)} - ${formatDateDM(s.endDate)}`);
+      const uniquePeriods = Array.from(new Set(periodStrings));
+      const periodsStr = uniquePeriods.join(", ");
+
+      // Cost: sum of effective prices as shown in UI
+      let hasAnyPrice = false;
+      let customerTotalCost = 0;
+      group.subs.forEach(s => {
+        const cust = customers.find(c => c.id === s.customerId);
+        const isPayPerDay = cust?.dealType === "pay_per_day";
+        const isDaConcordare = s.priceMode === "da_concordare";
+        if (!isPayPerDay && !isDaConcordare) {
+          hasAnyPrice = true;
+          customerTotalCost += getSubscriptionEffectivePrice(s) || 0;
+        }
+      });
+
+      if (hasAnyPrice) {
+        grandTotal += customerTotalCost;
+      }
+
+      const costDisplay = hasAnyPrice ? `${customerTotalCost} €` : "";
+
+      return [
+        group.customerName,
+        bedNumbersStr,
+        periodsStr,
+        costDisplay
+      ];
+    });
+
+    // Create landscape A4 PDF document
+    const doc = new jsPDF({
+      orientation: "landscape",
+      unit: "mm",
+      format: "a4"
+    });
+
+    const drawHeader = (pageNumber: number) => {
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(18);
+      doc.setTextColor(2, 90, 112); // #025A70
+      doc.text("LIDO SAMARINDA", 14, 15);
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(100, 116, 139);
+      doc.text("ELENCO ABBONATI", 14, 21);
+
+      const periodStr = `Periodo Selezionato: ${formatDateDM(printStartDate)} - ${formatDateDM(printEndDate)}`;
+      doc.text(periodStr, 14, 27);
+
+      const genTimeStr = `Generato il: ${getFormattedNow()}`;
+      doc.text(genTimeStr, 220, 27);
+
+      doc.setDrawColor(226, 232, 240);
+      doc.line(14, 31, 283, 31);
+    };
+
+    autoTable(doc, {
+      startY: 38,
+      head: [["Cliente", "Ombrelloni", "Periodo", "Costo (€)"]],
+      body: tableBody,
+      foot: [[`Totale Clienti: ${clientsCount}`, "", "TOTALE:", `${grandTotal} €`]],
+      theme: "striped",
+      headStyles: { fillColor: [2, 90, 112] },
+      footStyles: { fillColor: [241, 245, 249], textColor: [15, 23, 42], fontStyle: "bold" },
+      styles: { font: "helvetica", fontSize: 10, cellPadding: 3 },
+      columnStyles: {
+        0: { cellWidth: 90 }, // Cliente
+        1: { cellWidth: 50 }, // Ombrelloni
+        2: { cellWidth: 89 }, // Periodo
+        3: { cellWidth: 40, halign: "right" }, // Costo
+      },
+      margin: { top: 38, left: 14, right: 14, bottom: 14 },
+      didDrawPage: (data) => {
+        drawHeader(data.pageNumber);
+      }
+    });
+
+    doc.save(`elenco_abbonati_${printStartDate}_${printEndDate}.pdf`);
+    setShowPrintModal(false);
+  };
 
   const handleNewPeriodIdChange = (pId: string) => {
     setNewPeriodId(pId);
@@ -654,6 +1110,27 @@ export default function SubscriptionsModule({
     }
   };
 
+  const handleSaveHalfDayPrice = async () => {
+    if (configHalfDayPrice === "" || isNaN(Number(configHalfDayPrice))) {
+      setErrorMessage("Inserisci un prezzo valido per la mezza giornata (in centesimi).");
+      return;
+    }
+    setSaving(true);
+    setErrorMessage(null);
+    try {
+      await setDoc(doc(db, "config", "subscriptionSetup"), {
+        ...subscriptionSetup,
+        prezzoMezzaGiornata: Math.round(Number(configHalfDayPrice))
+      });
+      setSuccessMessage("Prezzo mezza giornata salvato con successo!");
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err: any) {
+      setErrorMessage("Errore nel salvataggio del prezzo mezza giornata: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleSaveSubPriceAndSetup = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedSubForEdit || !selectedSubForEdit.id) return;
@@ -764,6 +1241,7 @@ export default function SubscriptionsModule({
       slotTypeId?: string;
       priceMode?: "listino" | "concordato" | "da_concordare";
       agreedPrice?: number | null | "";
+      soloWeekend?: boolean;
     },
     conflicts: any[],
     decisions: Record<string, "skip" | "overwrite">
@@ -795,16 +1273,34 @@ export default function SubscriptionsModule({
         notes: "",
         createdAt: new Date().toISOString(),
         pricingRule: subData.pricingRule,
-        weekendRate: subData.weekendRate
+        weekendRate: subData.weekendRate,
+        soloWeekend: subData.soloWeekend || false
       };
 
       await setDoc(subRef, sanitizeForFirestore(newSub));
 
       // Create Bookings
-      const dates = getDatesInRange(subData.startDate, subData.endDate);
+      let dates = getDatesInRange(subData.startDate, subData.endDate);
+      if (subData.soloWeekend) {
+        dates = dates.filter((d) => {
+          const parts = d.split("-");
+          if (parts.length === 3) {
+            const year = Number(parts[0]);
+            const month = Number(parts[1]) - 1;
+            const day = Number(parts[2]);
+            const dateObj = new Date(year, month, day);
+            const dayOfWeek = dateObj.getDay();
+            return dayOfWeek === 0 || dayOfWeek === 6;
+          }
+          return false;
+        });
+      }
       let countCreated = 0;
       let countSkipped = 0;
       let countOverwritten = 0;
+
+      let batch = writeBatch(db);
+      let opCount = 0;
 
       for (const dt of dates) {
         for (const bNum of subData.beds) {
@@ -813,38 +1309,73 @@ export default function SubscriptionsModule({
             (c) => c.date === dt && c.bedNumber === bNum
           );
 
+          let isOverwrite = false;
           if (matchConflict) {
             const decision = decisions[matchConflict.id] || "skip";
             if (decision === "skip") {
               countSkipped++;
               continue; // Skip creating booking
             } else {
-              // Overwrite: delete existing booking
-              if (matchConflict.id) {
-                await deleteDoc(doc(db, "bookings", matchConflict.id));
-              }
+              isOverwrite = true;
               countOverwritten++;
             }
           } else {
             countCreated++;
           }
 
-          // Create Booking
-          const bookingData = {
-            customerName: customer.name,
-            customerPhone: customer.phone || "",
-            customerType: "subscriber" as const,
+          // If overwrite and a valid conflict ID exists, delete existing booking
+          if (isOverwrite && matchConflict.id) {
+            batch.delete(doc(db, "bookings", matchConflict.id));
+            opCount++;
+            if (opCount >= 450) {
+              await batch.commit();
+              batch = writeBatch(db);
+              opCount = 0;
+            }
+          }
+
+          // Create Booking using deterministic ID
+          const slotKey = subData.slot === "full_day" ? "full" : subData.slot;
+          const bookingId = `${dt}_${bNum}_${slotKey}`;
+          const bookingRef = doc(db, "bookings", bookingId);
+
+          const numLettini = getBedLettiniCount(bNum, bedsConfig);
+          const defaultItems = getBedItems(bNum, numLettini);
+          const risorse = [{ postazione: bNum, items: defaultItems }];
+
+          const finalBooking: Booking = {
+            id: bookingId,
             bedNumber: bNum,
             date: dt,
             slot: subData.slot,
-            source: "subscription" as const,
-            subscriptionId: subRef.id,
+            tipoPrenotazione: "intera",
+            risorse: risorse,
             customerId: subData.customerId,
+            customerName: customer.name,
+            customerPhone: customer.phone || "",
+            customerType: "subscriber",
+            subscriptionId: subRef.id,
+            source: "subscription",
+            notes: "",
             isConfirmedPayPerDay: customer.dealType === "pay_per_day" ? false : true,
-            dealType: customer.dealType
+            dealType: customer.dealType,
+            createdAt: new Date().toISOString()
           };
-          await createBookingTransactional(bookingData);
+
+          batch.set(bookingRef, sanitizeForFirestore(finalBooking));
+          opCount++;
+
+          if (opCount >= 450) {
+            await batch.commit();
+            batch = writeBatch(db);
+            opCount = 0;
+          }
         }
+      }
+
+      // Commit any remaining operations
+      if (opCount > 0) {
+        await batch.commit();
       }
 
       setShowAddPeriodModal(false);
@@ -854,6 +1385,7 @@ export default function SubscriptionsModule({
       setNewPeriodEndDate("");
       setNewPeriodPrice(0);
       setNewPeriodPricingRule("standard");
+      setNewPeriodSoloWeekend(false);
       setPendingSubscriptionData(null);
       setConflictDecisions({});
       setConflictsList([]);
@@ -901,7 +1433,9 @@ export default function SubscriptionsModule({
         beds,
         newPeriodStartDate,
         newPeriodEndDate,
-        newPeriodSlot
+        newPeriodSlot,
+        undefined,
+        newPeriodSoloWeekend
       );
 
       const subData = {
@@ -916,7 +1450,8 @@ export default function SubscriptionsModule({
         periodId: newPeriodId || undefined,
         slotTypeId: newPeriodSlotTypeId || undefined,
         priceMode: newPeriodPriceMode,
-        agreedPrice: newPeriodPriceMode === "concordato" ? (newPeriodAgreedPrice === "" ? null : Number(newPeriodAgreedPrice)) : null
+        agreedPrice: newPeriodPriceMode === "concordato" ? (newPeriodAgreedPrice === "" ? null : Number(newPeriodAgreedPrice)) : null,
+        soloWeekend: newPeriodSoloWeekend
       };
 
       if (conflicts.length > 0) {
@@ -1021,11 +1556,28 @@ export default function SubscriptionsModule({
       await setDoc(newSubRef, sanitizeForFirestore(migratedSub));
 
       // 3. Delete old bookings from decorrenza onwards
-      const oldBookingsToDelete = bookings.filter(
-        (b) => b.subscriptionId === moveSub.id && b.date >= moveEffectiveDate
+      const querySnap: any = await getDocs(query(collection(db, "bookings"), where("subscriptionId", "==", moveSub.id)));
+      const fetchedBookings = querySnap.docs.map((d: any) => ({
+        id: d.id,
+        ...d.data()
+      }));
+
+      const oldBookingsToDelete = fetchedBookings.filter(
+        (b: any) => b.date >= moveEffectiveDate
       );
-      for (const b of oldBookingsToDelete) {
-        await deleteDoc(doc(db, "bookings", b.id));
+
+      let deletedCount = 0;
+      if (oldBookingsToDelete.length > 0) {
+        const chunkSize = 400;
+        for (let i = 0; i < oldBookingsToDelete.length; i += chunkSize) {
+          const chunk = oldBookingsToDelete.slice(i, i + chunkSize);
+          const batch = writeBatch(db);
+          for (const b of chunk) {
+            batch.delete(doc(db, "bookings", b.id));
+            deletedCount++;
+          }
+          await batch.commit();
+        }
       }
 
       // 4. Generate new bookings on new bed from decorrenza onwards
@@ -1051,7 +1603,7 @@ export default function SubscriptionsModule({
       setMoveSub(null);
       setMoveNewBed("");
       setMoveEffectiveDate("");
-      setSuccessMessage("Spostamento completato con successo!");
+      setSuccessMessage(`Spostamento completato con successo. ${deletedCount} prenotazioni eliminate.`);
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err: any) {
       setErrorMessage("Errore durante lo spostamento: " + err.message);
@@ -1081,12 +1633,29 @@ export default function SubscriptionsModule({
       const waivedDates = getDatesInRange(waiverStart, waiverEnd);
       const totalWaivedDays = waivedDates.length;
 
-      // 1. Delete matching bookings
-      const bookingsToWaiver = bookings.filter(
-        (b) => b.subscriptionId === waiverSub.id && b.date >= waiverStart && b.date <= waiverEnd
+      // 1. Delete matching bookings by querying Firestore directly
+      const querySnap: any = await getDocs(query(collection(db, "bookings"), where("subscriptionId", "==", waiverSub.id)));
+      const fetchedBookings = querySnap.docs.map((d: any) => ({
+        id: d.id,
+        ...d.data()
+      }));
+
+      const bookingsToWaiver = fetchedBookings.filter(
+        (b: any) => b.date >= waiverStart && b.date <= waiverEnd
       );
-      for (const b of bookingsToWaiver) {
-        await deleteDoc(doc(db, "bookings", b.id));
+
+      let deletedCount = 0;
+      if (bookingsToWaiver.length > 0) {
+        const chunkSize = 400;
+        for (let i = 0; i < bookingsToWaiver.length; i += chunkSize) {
+          const chunk = bookingsToWaiver.slice(i, i + chunkSize);
+          const batch = writeBatch(db);
+          for (const b of chunk) {
+            batch.delete(doc(db, "bookings", b.id));
+            deletedCount++;
+          }
+          await batch.commit();
+        }
       }
 
       // 2. Write Ledger waiver credit
@@ -1107,7 +1676,7 @@ export default function SubscriptionsModule({
       setWaiverStart("");
       setWaiverEnd("");
       setWaiverCredit("");
-      setSuccessMessage("Rinuncia registrata, credito accreditato sul conto.");
+      setSuccessMessage(`Rinuncia registrata. ${deletedCount} prenotazioni eliminate.`);
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err: any) {
       setErrorMessage("Errore durante la rinuncia: " + err.message);
@@ -1140,19 +1709,103 @@ export default function SubscriptionsModule({
         status: "cancelled"
       }, { merge: true });
 
-      // 2. Delete future bookings
+      // 2. Delete future bookings by querying Firestore directly
+      const querySnap: any = await getDocs(query(collection(db, "bookings"), where("subscriptionId", "==", sub.id)));
+      const fetchedBookings = querySnap.docs.map((d: any) => ({
+        id: d.id,
+        ...d.data()
+      }));
+
       const today = getRomeTodayString();
-      const bookingsToCancel = bookings.filter(
-        (b) => b.subscriptionId === sub.id && b.date >= today
+      const bookingsToCancel = fetchedBookings.filter(
+        (b: any) => b.date >= today
       );
-      for (const b of bookingsToCancel) {
-        await deleteDoc(doc(db, "bookings", b.id));
+
+      let deletedCount = 0;
+      if (bookingsToCancel.length > 0) {
+        const chunkSize = 400;
+        for (let i = 0; i < bookingsToCancel.length; i += chunkSize) {
+          const chunk = bookingsToCancel.slice(i, i + chunkSize);
+          const batch = writeBatch(db);
+          for (const b of chunk) {
+            batch.delete(doc(db, "bookings", b.id));
+            deletedCount++;
+          }
+          await batch.commit();
+        }
       }
 
-      setSuccessMessage("Abbonamento disdetto e prenotazioni future rimosse.");
+      setSuccessMessage(`Abbonamento disdetto. ${deletedCount} prenotazioni eliminate.`);
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err: any) {
       setErrorMessage("Errore nella disdetta: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Search for orphaned bookings
+  const handleSearchOrphanBookings = async () => {
+    setLoadingOrphans(true);
+    setErrorMessage(null);
+    try {
+      // 1. Fetch all bookings
+      const bookingsSnap: any = await getDocs(collection(db, "bookings"));
+      const allBookings = bookingsSnap.docs.map((d: any) => ({
+        id: d.id,
+        ...d.data()
+      }));
+      const subBookings = allBookings.filter(b => b.subscriptionId && b.subscriptionId.trim() !== "");
+
+      // 2. Fetch all subscriptions
+      const subsSnap: any = await getDocs(collection(db, "subscriptions"));
+      const subsList = subsSnap.docs.map((d: any) => ({
+        id: d.id,
+        ...d.data()
+      }));
+      const subsMap = new Map(subsList.map(s => [s.id, s]));
+
+      // 3. Find orphans (either subscription doesn't exist, or exists but is cancelled)
+      const orphans = subBookings.filter(b => {
+        const refSub = subsMap.get(b.subscriptionId) as any;
+        if (!refSub) return true; // Does not exist
+        if (refSub.status === "cancelled") return true; // Cancelled
+        return false;
+      });
+
+      setOrphanBookings(orphans);
+      setShowBonificaModal(true);
+    } catch (err: any) {
+      setErrorMessage("Errore durante la ricerca di prenotazioni orfane: " + err.message);
+    } finally {
+      setLoadingOrphans(false);
+    }
+  };
+
+  // Execute deletion of orphaned bookings
+  const handleExecuteBonifica = async () => {
+    if (orphanBookings.length === 0) return;
+    setSaving(true);
+    setErrorMessage(null);
+    try {
+      let deletedCount = 0;
+      const chunkSize = 400;
+      for (let i = 0; i < orphanBookings.length; i += chunkSize) {
+        const chunk = orphanBookings.slice(i, i + chunkSize);
+        const batch = writeBatch(db);
+        for (const b of chunk) {
+          batch.delete(doc(db, "bookings", b.id));
+          deletedCount++;
+        }
+        await batch.commit();
+      }
+
+      setShowBonificaModal(false);
+      setOrphanBookings([]);
+      setSuccessMessage(`Bonifica completata con successo. ${deletedCount} prenotazioni eliminate.`);
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err: any) {
+      setErrorMessage("Errore durante l'eliminazione delle prenotazioni orfane: " + err.message);
     } finally {
       setSaving(false);
     }
@@ -1335,7 +1988,15 @@ export default function SubscriptionsModule({
   };
 
   // Type B - Confirmation (Present/Absent today/on specific day)
-  const handleMarkBAttendance = async (customerId: string, date: string, bedNumber: number, slot: BookingSlot, status: "present" | "absent", customDailyPrice = 15) => {
+  const handleMarkBAttendance = async (
+    customerId: string,
+    date: string,
+    bedNumber: number,
+    slot: BookingSlot,
+    status: "present" | "absent",
+    customDailyPrice = 15,
+    tipoGiornata: "intera" | "mezza" = "intera"
+  ) => {
     setSaving(true);
     setErrorMessage(null);
 
@@ -1344,79 +2005,237 @@ export default function SubscriptionsModule({
       const attRef = doc(db, "attendance", attendanceId);
       const chargeId = `charge_${date}_${customerId}_${bedNumber}`;
 
-      if (status === "present") {
-        // 1. Confirm booking as active/pieno
-        const matchBooking = bookings.find(b => b.customerId === customerId && b.date === date && b.bedNumber === bedNumber);
-        if (matchBooking) {
-          await setDoc(doc(db, "bookings", matchBooking.id), {
-            isConfirmedPayPerDay: true
-          }, { merge: true });
-        } else {
-          // If booking was deleted, regenerate it
-          const customer = customers.find(c => c.id === customerId);
-          if (customer) {
-            await createBookingTransactional({
-              customerName: customer.name,
-              customerPhone: customer.phone || "",
-              customerType: "subscriber",
-              bedNumber,
-              date,
-              slot,
-              source: "subscription",
-              subscriptionId: "", // standalone confirm
-              customerId,
-              isConfirmedPayPerDay: true,
-              dealType: "pay_per_day"
+      // Run transactional writes
+      await runTransaction(db, async (tx) => {
+        // Read setup config for mezza giornata price
+        const setupSnap = await tx.get(doc(db, "config", "subscriptionSetup"));
+        let prezzoMezzaCents: number | null = null;
+        if (setupSnap.exists()) {
+          prezzoMezzaCents = setupSnap.data()?.prezzoMezzaGiornata ?? null;
+        }
+
+        if (status === "present") {
+          // Verify price config exists if "mezza" is requested
+          if (tipoGiornata === "mezza") {
+            if (prezzoMezzaCents === null || prezzoMezzaCents === undefined) {
+              throw new Error("Il prezzo per la mezza giornata non è configurato. Configuralo prima di registrare una presenza a mezza giornata.");
+            }
+          }
+
+          const resolvedPrice = tipoGiornata === "mezza" 
+            ? prezzoMezzaCents! / 100 
+            : customDailyPrice;
+
+          // 1. Confirm booking
+          const matchBooking = bookings.find(b => b.customerId === customerId && b.date === date && b.bedNumber === bedNumber);
+          if (matchBooking) {
+            tx.update(doc(db, "bookings", matchBooking.id), {
+              isConfirmedPayPerDay: true
             });
+          } else {
+            // Generate booking transactional if missing
+            const customer = customers.find(c => c.id === customerId);
+            if (customer) {
+              const bookingRef = doc(collection(db, "bookings"));
+              tx.set(bookingRef, sanitizeForFirestore({
+                customerName: customer.name,
+                customerPhone: customer.phone || "",
+                customerType: "subscriber",
+                bedNumber,
+                date,
+                slot,
+                source: "subscription",
+                subscriptionId: "",
+                customerId,
+                isConfirmedPayPerDay: true,
+                dealType: "pay_per_day",
+                createdAt: new Date().toISOString()
+              }));
+            }
+          }
+
+          // 2. Write Ledger daily_charge entry
+          tx.set(doc(db, "ledger", chargeId), sanitizeForFirestore({
+            customerId,
+            kind: "daily_charge",
+            amount: resolvedPrice,
+            date,
+            note: `Presenza ${formatItalianDate(date)} - Ombrellone ${bedNumber} (${tipoGiornata === "mezza" ? "Mezza giornata" : "Giornata intera"})`,
+            createdAt: new Date().toISOString()
+          }));
+
+          // 3. Mark Attendance
+          tx.set(attRef, sanitizeForFirestore({
+            id: attendanceId,
+            customerId,
+            bedNumber,
+            date,
+            slot,
+            status: "present",
+            tipoGiornata,
+            chargeLedgerId: chargeId
+          }));
+        } else {
+          // status === "absent"
+          // 1. Delete booking
+          const matchBooking = bookings.find(b => b.customerId === customerId && b.date === date && b.bedNumber === bedNumber);
+          if (matchBooking) {
+            tx.delete(doc(db, "bookings", matchBooking.id));
+          }
+
+          // 2. Delete daily_charge
+          tx.delete(doc(db, "ledger", chargeId));
+
+          // 3. Save Attendance as absent
+          tx.set(attRef, sanitizeForFirestore({
+            id: attendanceId,
+            customerId,
+            bedNumber,
+            date,
+            slot,
+            status: "absent",
+            tipoGiornata: "intera"
+          }));
+        }
+      });
+
+      setSuccessMessage("Presenza salvata.");
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err: any) {
+      setErrorMessage("Errore registrazione presenza: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleUpdateAttendanceTipo = async (
+    customerId: string,
+    date: string,
+    bedNumber: number,
+    slot: BookingSlot,
+    tipoGiornata: "intera" | "mezza",
+    customDailyPrice = 15
+  ) => {
+    setSaving(true);
+    setErrorMessage(null);
+
+    try {
+      const attendanceId = `${date}_${customerId}_${bedNumber}`;
+      const attRef = doc(db, "attendance", attendanceId);
+      const chargeId = `charge_${date}_${customerId}_${bedNumber}`;
+
+      await runTransaction(db, async (tx) => {
+        // Read setup config for mezza giornata price
+        const setupSnap = await tx.get(doc(db, "config", "subscriptionSetup"));
+        let prezzoMezzaCents: number | null = null;
+        if (setupSnap.exists()) {
+          prezzoMezzaCents = setupSnap.data()?.prezzoMezzaGiornata ?? null;
+        }
+
+        if (tipoGiornata === "mezza") {
+          if (prezzoMezzaCents === null || prezzoMezzaCents === undefined) {
+            throw new Error("Il prezzo per la mezza giornata non è configurato. Configuralo prima di impostare la mezza giornata.");
           }
         }
 
-        // 2. Create Ledger daily_charge entry
-        await setDoc(doc(db, "ledger", chargeId), sanitizeForFirestore({
+        const resolvedPrice = tipoGiornata === "mezza" 
+          ? prezzoMezzaCents! / 100 
+          : customDailyPrice;
+
+        // Update ledger entry
+        tx.set(doc(db, "ledger", chargeId), sanitizeForFirestore({
           customerId,
           kind: "daily_charge",
-          amount: customDailyPrice,
+          amount: resolvedPrice,
           date,
-          note: `Presenza ${formatItalianDate(date)} - Ombrellone ${bedNumber}`,
+          note: `Presenza ${formatItalianDate(date)} - Ombrellone ${bedNumber} (${tipoGiornata === "mezza" ? "Mezza giornata" : "Giornata intera"})`,
           createdAt: new Date().toISOString()
         }));
 
-        // 3. Mark Attendance
-        await setDoc(attRef, sanitizeForFirestore({
+        // Update attendance doc
+        tx.set(attRef, sanitizeForFirestore({
           id: attendanceId,
           customerId,
           bedNumber,
           date,
           slot,
           status: "present",
+          tipoGiornata,
           chargeLedgerId: chargeId
         }));
-      } else {
-        // status === "absent"
-        // 1. Delete booking to free seat on map
-        const matchBooking = bookings.find(b => b.customerId === customerId && b.date === date && b.bedNumber === bedNumber);
-        if (matchBooking) {
-          await deleteDoc(doc(db, "bookings", matchBooking.id));
-        }
+      });
 
-        // 2. Delete daily_charge if any
-        await deleteDoc(doc(db, "ledger", chargeId));
-
-        // 3. Save Attendance as absent
-        await setDoc(attRef, sanitizeForFirestore({
-          id: attendanceId,
-          customerId,
-          bedNumber,
-          date,
-          slot,
-          status: "absent"
-        }));
-      }
-
-      setSuccessMessage("Presenza salvata.");
+      setSuccessMessage("Tipo giornata modificato con successo.");
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err: any) {
-      setErrorMessage("Errore registrazione presenza: " + err.message);
+      setErrorMessage("Errore modifica tipo giornata: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Reconciliation handlers (Part C)
+  const handleReconcileManually = async (dpId: string, subId: string) => {
+    setSaving(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      const dpRef = doc(db, "dailyPresences", dpId);
+      await setDoc(dpRef, {
+        matchStatus: "matched",
+        matchedSubscriptionId: subId,
+        matchedCustomerId: selectedCustomerId
+      }, { merge: true });
+      setSuccessMessage("Presenza riconciliata con successo!");
+      setTimeout(() => setSuccessMessage(null), 4000);
+    } catch (err: any) {
+      setErrorMessage("Errore durante la riconciliazione: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleMarkAbsent = async (dateStr: string, bedNum: number, slot: string, subId: string) => {
+    setSaving(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      const platform = bedNum <= 34 ? "sx" : "dx";
+      const normSlot = slot === "full_day" ? "both" : slot;
+      const presenceId = `${dateStr}_${platform}_${bedNum}_${normSlot}`;
+      
+      const dpRef = doc(db, "dailyPresences", presenceId);
+      await setDoc(dpRef, {
+        platform,
+        bedNumber: bedNum,
+        date: dateStr,
+        slot: normSlot,
+        rawName: "ASSENTE_CONFIGURATO",
+        parseConfidence: "clean",
+        importedAt: new Date().toISOString(),
+        matchStatus: "matched",
+        matchedSubscriptionId: subId,
+        matchedCustomerId: selectedCustomerId
+      });
+      setSuccessMessage("Giornata segnata come assenza con successo!");
+      setTimeout(() => setSuccessMessage(null), 4000);
+    } catch (err: any) {
+      setErrorMessage("Errore nell'impostare l'assenza: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleRemoveAbsent = async (dpId: string) => {
+    setSaving(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      await deleteDoc(doc(db, "dailyPresences", dpId));
+      setSuccessMessage("Assenza rimossa con successo!");
+      setTimeout(() => setSuccessMessage(null), 4000);
+    } catch (err: any) {
+      setErrorMessage("Errore nella rimozione dell'assenza: " + err.message);
     } finally {
       setSaving(false);
     }
@@ -1667,6 +2486,24 @@ export default function SubscriptionsModule({
               <CalendarDays className="w-4 h-4" />
             </button>
             <button
+              id="btn-bulk-import-modal"
+              onClick={() => setShowBulkImportModal(true)}
+              className="px-2 py-1.5 bg-[#025A70] hover:bg-[#014152] text-white text-xs font-bold rounded-xl transition-colors flex items-center gap-1 cursor-pointer shadow-sm"
+              title="Importa elenco abbonati"
+            >
+              <Users className="w-4 h-4" />
+              <span>Importa elenco abbonati</span>
+            </button>
+            <button
+              id="btn-print-subscribers-modal"
+              onClick={() => setShowPrintModal(true)}
+              className="px-2 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-xl transition-colors flex items-center gap-1 cursor-pointer shadow-sm"
+              title="Stampa elenco abbonati"
+            >
+              <Printer className="w-4 h-4" />
+              <span>Stampa</span>
+            </button>
+            <button
               id="btn-sub-setup-tab"
               onClick={() => {
                 setActiveTab(activeTab === "setup" ? "list" : "setup");
@@ -1680,6 +2517,16 @@ export default function SubscriptionsModule({
             >
               <Settings className="w-4 h-4 animate-spin-hover" />
               <span>Setup</span>
+            </button>
+            <button
+              id="btn-sub-bonifica-orphans"
+              onClick={handleSearchOrphanBookings}
+              disabled={loadingOrphans}
+              className="px-2 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 text-xs font-bold rounded-xl transition-colors flex items-center gap-1 cursor-pointer shadow-sm"
+              title="Bonifica prenotazioni orfane"
+            >
+              <AlertCircle className={`w-4 h-4 ${loadingOrphans ? "animate-spin" : ""}`} />
+              <span>{loadingOrphans ? "Verifica..." : "Bonifica orfane"}</span>
             </button>
             <button
               id="btn-sub-new-tab"
@@ -2159,6 +3006,49 @@ export default function SubscriptionsModule({
 
             </div>
 
+            {/* CONFIGURAZIONE PREZZO MEZZA GIORNATA */}
+            <div className="space-y-4 bg-slate-50/50 p-5 border border-slate-100 rounded-2xl">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200/40 pb-3">
+                <div className="space-y-1">
+                  <h4 className="font-extrabold text-xs text-slate-700 uppercase tracking-wider">Configurazione Prezzo Mezza Giornata</h4>
+                  <p className="text-[10px] text-slate-500 font-semibold">
+                    Inserisci il prezzo per la mezza giornata in centesimi (es. 1000 per 10,00 €). Se non configurato, la registrazione presenze a mezza giornata non sarà permessa.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSaveHalfDayPrice}
+                  disabled={saving}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs rounded-xl flex items-center gap-1.5 shadow-sm transition-all cursor-pointer self-start sm:self-center"
+                >
+                  <Save className="w-4 h-4" />
+                  <span>{saving ? "Salvataggio..." : "Salva Prezzo"}</span>
+                </button>
+              </div>
+
+              <div className="bg-white p-4 border border-slate-200/60 rounded-xl space-y-3 max-w-sm shadow-sm">
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase">Prezzo Mezza Giornata (centesimi) *</label>
+                  <div className="relative">
+                    <input
+                      id="input-config-half-day-price"
+                      type="number"
+                      placeholder="es. 1000"
+                      value={configHalfDayPrice}
+                      onChange={(e) => setConfigHalfDayPrice(e.target.value === "" ? "" : Number(e.target.value))}
+                      className="w-full pl-3 pr-8 py-2 bg-slate-50 border border-slate-100 rounded-xl text-xs font-bold text-slate-800 focus:bg-white focus:ring-2 focus:ring-[#025A70]/20 transition-all outline-hidden"
+                    />
+                    <span className="absolute right-2.5 top-2 text-[10px] font-black text-slate-400">cents</span>
+                  </div>
+                  {configHalfDayPrice !== "" && (
+                    <span className="text-[10px] text-emerald-600 block font-semibold mt-1">
+                      Equivale a: {(Number(configHalfDayPrice) / 100).toFixed(2)} €
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
             {/* 2. LISTINO PREZZI MATRIX GRID */}
             <div className="space-y-4 bg-slate-50/50 p-5 border border-slate-100 rounded-2xl">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200/40 pb-3">
@@ -2498,6 +3388,11 @@ export default function SubscriptionsModule({
                                 }`}>
                                   {isActive ? "Attivo" : "Disdetto"}
                                 </span>
+                                {sub.soloWeekend && (
+                                  <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-800 border border-amber-200 shadow-2xs">
+                                    Solo weekend
+                                  </span>
+                                )}
                               </div>
                             </div>
 
@@ -2633,7 +3528,22 @@ export default function SubscriptionsModule({
 
                   // Retrieve all dates inside sub periods
                   const allDates = custSubs.flatMap(s => {
-                    return getDatesInRange(s.startDate, s.endDate).map(dt => ({
+                    let dates = getDatesInRange(s.startDate, s.endDate);
+                    if (s.soloWeekend) {
+                      dates = dates.filter((d) => {
+                        const parts = d.split("-");
+                        if (parts.length === 3) {
+                          const year = Number(parts[0]);
+                          const month = Number(parts[1]) - 1;
+                          const day = Number(parts[2]);
+                          const dateObj = new Date(year, month, day);
+                          const dayOfWeek = dateObj.getDay();
+                          return dayOfWeek === 0 || dayOfWeek === 6;
+                        }
+                        return false;
+                      });
+                    }
+                    return dates.map(dt => ({
                       date: dt,
                       bedNumber: s.bedNumbers[0], // assume single/first bed
                       slot: s.slot
@@ -2669,8 +3579,37 @@ export default function SubscriptionsModule({
                                       ? "bg-slate-100 text-slate-600"
                                       : "bg-amber-100 text-amber-800 animate-pulse"
                                 }`}>
-                                  {status === "present" ? "PRESENTE" : status === "absent" ? "ASSENTE" : "DA CONFERMARE"}
+                                  {status === "present" ? (attDoc?.tipoGiornata === "mezza" ? "PRESENTE (1/2)" : "PRESENTE") : status === "absent" ? "ASSENTE" : "DA CONFERMARE"}
                                 </span>
+
+                                {status === "present" && (
+                                  <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                                    <button
+                                      id={`toggle-intera-${date}_${bedNumber}`}
+                                      type="button"
+                                      onClick={() => handleUpdateAttendanceTipo(selectedCustomerId!, date, bedNumber, slot, "intera")}
+                                      className={`px-1.5 py-0.5 text-[9px] font-black rounded-md transition-all cursor-pointer ${
+                                        (attDoc?.tipoGiornata || "intera") === "intera"
+                                          ? "bg-white text-slate-800 shadow-xs"
+                                          : "text-slate-400 hover:text-slate-700"
+                                      }`}
+                                    >
+                                      Intera
+                                    </button>
+                                    <button
+                                      id={`toggle-mezza-${date}_${bedNumber}`}
+                                      type="button"
+                                      onClick={() => handleUpdateAttendanceTipo(selectedCustomerId!, date, bedNumber, slot, "mezza")}
+                                      className={`px-1.5 py-0.5 text-[9px] font-black rounded-md transition-all cursor-pointer ${
+                                        attDoc?.tipoGiornata === "mezza"
+                                          ? "bg-white text-amber-700 shadow-xs"
+                                          : "text-slate-400 hover:text-slate-700"
+                                      }`}
+                                    >
+                                      Mezza
+                                    </button>
+                                  </div>
+                                )}
 
                                 {/* Confirm Buttons */}
                                 <div className="flex gap-1.5">
@@ -2707,6 +3646,158 @@ export default function SubscriptionsModule({
                 })()}
               </div>
             )}
+
+            {/* RICONCILIAZIONE PRESENZE (STORICO DOCX) - Part C */}
+            <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm space-y-4">
+              <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+                <div className="space-y-0.5">
+                  <h4 className="text-xs font-black text-slate-800 uppercase tracking-wider">Riconciliazione Presenze (Storico Importazioni)</h4>
+                  <p className="text-[10px] text-slate-500 font-semibold">Monitora e riconcilia le presenze caricate dai fogli di lavoro con l'abbonamento del cliente.</p>
+                </div>
+              </div>
+
+              {(() => {
+                const activeSubs = subscriptions.filter(s => s.customerId === selectedCustomerId && s.status === "active");
+                if (activeSubs.length === 0) {
+                  return <p className="text-xs text-slate-400 italic">Nessun periodo di abbonamento attivo configurato per questo cliente.</p>;
+                }
+
+                // Gather all subscription days/beds combinations
+                const subscriptionDays: { date: string; bedNumber: number; slot: string; subscriptionId: string }[] = [];
+                activeSubs.forEach((sub) => {
+                  let dates = getDatesInRange(sub.startDate, sub.endDate);
+                  if (sub.soloWeekend) {
+                    dates = dates.filter((d) => {
+                      const parts = d.split("-");
+                      if (parts.length === 3) {
+                        const year = Number(parts[0]);
+                        const month = Number(parts[1]) - 1;
+                        const day = Number(parts[2]);
+                        const dateObj = new Date(year, month, day);
+                        const dayOfWeek = dateObj.getDay();
+                        return dayOfWeek === 0 || dayOfWeek === 6;
+                      }
+                      return false;
+                    });
+                  }
+                  dates.forEach((dateStr) => {
+                    sub.bedNumbers.forEach((bedNum) => {
+                      subscriptionDays.push({
+                        date: dateStr,
+                        bedNumber: bedNum,
+                        slot: sub.slot,
+                        subscriptionId: sub.id!
+                      });
+                    });
+                  });
+                });
+
+                if (subscriptionDays.length === 0) {
+                  return <p className="text-xs text-slate-400 italic">Nessun giorno di presenza da monitorare nell'intervallo dell'abbonamento.</p>;
+                }
+
+                // Sort by date descending
+                subscriptionDays.sort((a, b) => b.date.localeCompare(a.date));
+
+                return (
+                  <div className="max-h-[350px] overflow-y-auto border border-slate-100 rounded-xl divide-y divide-slate-100">
+                    {subscriptionDays.map((day, idx) => {
+                      // Find if a presence document exists for this day and bed
+                      const presence = dailyPresences.find(
+                        dp => dp.date === day.date && Number(dp.bedNumber) === Number(day.bedNumber)
+                      );
+
+                      // Determine badges & actions
+                      const isAbsentDoc = presence && presence.rawName === "ASSENTE_CONFIGURATO";
+
+                      return (
+                        <div key={`${day.date}_${day.bedNumber}_${idx}`} className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs hover:bg-slate-50/50 transition-colors">
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span className="font-bold text-slate-800">{formatItalianDate(day.date)}</span>
+                              <span className="text-[10px] font-mono text-slate-400">({day.date})</span>
+                            </div>
+                            <div className="flex items-center gap-1.5 text-[10px] text-slate-500 font-semibold">
+                              <span>Lettino {day.bedNumber}</span>
+                              <span>•</span>
+                              <span>{day.slot === "full_day" ? "Giornata Intera" : day.slot === "morning" ? "Mattina" : "Pomeriggio"}</span>
+                            </div>
+                            {presence && (
+                              <p className="text-[10px] font-bold text-[#025A70] bg-[#EAF4F6] px-2 py-0.5 rounded w-max mt-1">
+                                Nome nel foglio: <span className="font-mono font-black italic">"{presence.rawName}"</span>
+                              </p>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2.5 self-end sm:self-center">
+                            {/* Badges */}
+                            {!presence ? (
+                              <span className="text-[9px] font-black uppercase px-2 py-1 bg-slate-100 text-slate-600 rounded-lg">
+                                Non Rilevato (Assente)
+                              </span>
+                            ) : isAbsentDoc ? (
+                              <span className="text-[9px] font-black uppercase px-2 py-1 bg-rose-50 text-rose-700 border border-rose-100 rounded-lg">
+                                Segnato Assente
+                              </span>
+                            ) : presence.matchStatus === "matched" ? (
+                              <span className="text-[9px] font-black uppercase px-2 py-1 bg-emerald-50 text-emerald-700 border border-emerald-100 rounded-lg">
+                                Presenza Abbonato
+                              </span>
+                            ) : presence.matchStatus === "bed_period_match_name_mismatch" ? (
+                              <span className="text-[9px] font-black uppercase px-2 py-1 bg-amber-50 text-amber-700 border border-amber-100 rounded-lg animate-pulse" title="Il nome rilevato differisce dall'abbonato">
+                                Ospite / Altro
+                              </span>
+                            ) : (
+                              <span className="text-[9px] font-black uppercase px-2 py-1 bg-slate-100 text-slate-500 rounded-lg">
+                                {presence.matchStatus}
+                              </span>
+                            )}
+
+                            {/* Actions */}
+                            <div className="flex items-center gap-1.5">
+                              {presence && presence.matchStatus === "bed_period_match_name_mismatch" && (
+                                <button
+                                  type="button"
+                                  disabled={saving}
+                                  onClick={() => handleReconcileManually(presence.id!, day.subscriptionId)}
+                                  className="px-2.5 py-1 text-[10px] font-black bg-amber-600 hover:bg-amber-700 text-white rounded-lg shadow-sm transition-all cursor-pointer shrink-0"
+                                  title="Riconcilia manualmente questa presenza"
+                                >
+                                  Riconcilia
+                                </button>
+                              )}
+
+                              {!presence && (
+                                <button
+                                  type="button"
+                                  disabled={saving}
+                                  onClick={() => handleMarkAbsent(day.date, day.bedNumber, day.slot, day.subscriptionId)}
+                                  className="px-2.5 py-1 text-[10px] font-black bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg transition-all cursor-pointer shrink-0"
+                                >
+                                  Segna Assente
+                                </button>
+                              )}
+
+                              {isAbsentDoc && (
+                                <button
+                                  type="button"
+                                  disabled={saving}
+                                  onClick={() => handleRemoveAbsent(presence.id!)}
+                                  className="px-2 py-1 text-[9px] font-black bg-rose-600 hover:bg-rose-700 text-white rounded-lg transition-all cursor-pointer shrink-0"
+                                  title="Rimuovi lo stato di assenza"
+                                >
+                                  Rimuovi Assenza
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+            </div>
 
             {/* 5. STORICO MOVIMENTI / LEDGER */}
             <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm space-y-4">
@@ -2892,7 +3983,34 @@ export default function SubscriptionsModule({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              {newPeriodStartDate && newPeriodEndDate && (
+                <div className="bg-slate-50 border border-slate-100/60 p-2.5 rounded-xl flex justify-between items-center text-xs text-slate-600">
+                  <span>Giorni generati:</span>
+                  <span className="font-bold text-slate-800">
+                    {(() => {
+                      let dates = getDatesInRange(newPeriodStartDate, newPeriodEndDate);
+                      if (newPeriodSoloWeekend) {
+                        dates = dates.filter(d => {
+                          const parts = d.split("-");
+                          if (parts.length === 3) {
+                            const year = Number(parts[0]);
+                            const month = Number(parts[1]) - 1;
+                            const day = Number(parts[2]);
+                            const dateObj = new Date(year, month, day);
+                            const dayOfWeek = dateObj.getDay();
+                            return dayOfWeek === 0 || dayOfWeek === 6;
+                          }
+                          return false;
+                        });
+                      }
+                      return dates.length;
+                    })()}{" "}
+                    {newPeriodSoloWeekend ? "weekend (sab/dom)" : "giorni totali"}
+                  </span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-3 items-end">
                 <div className="space-y-1">
                   <label className="text-[10px] font-bold text-slate-500 uppercase">Fascia Oraria *</label>
                   <select
@@ -2905,6 +4023,18 @@ export default function SubscriptionsModule({
                     <option value="morning">Mattina</option>
                     <option value="afternoon">Pomeriggio</option>
                   </select>
+                </div>
+                <div className="flex items-center gap-2 pb-2">
+                  <input
+                    id="checkbox-new-period-solo-weekend"
+                    type="checkbox"
+                    checked={newPeriodSoloWeekend}
+                    onChange={(e) => setNewPeriodSoloWeekend(e.target.checked)}
+                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 h-4 w-4 cursor-pointer"
+                  />
+                  <label htmlFor="checkbox-new-period-solo-weekend" className="text-xs font-semibold text-slate-700 cursor-pointer select-none">
+                    Solo weekend
+                  </label>
                 </div>
               </div>
               
@@ -3301,6 +4431,88 @@ export default function SubscriptionsModule({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 14. BONIFICA PRENOTAZIONI ORFANE MODAL */}
+      {showBonificaModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-xl max-w-2xl w-full space-y-4">
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="w-5 h-5 text-amber-600" />
+                <h3 className="font-extrabold text-sm text-slate-800 uppercase tracking-wider">Bonifica Prenotazioni Orfane</h3>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setShowBonificaModal(false)} 
+                className="text-slate-400 hover:text-slate-600 font-bold cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-xs text-slate-600 font-medium">
+                Queste prenotazioni sono associate ad abbonamenti eliminati, inesistenti o disdetti/annullati. Non sono più valide e occupano posti sulla mappa.
+              </p>
+              {orphanBookings.length === 0 ? (
+                <div className="bg-emerald-50 border border-emerald-100 p-4 rounded-xl text-center text-xs font-bold text-emerald-700">
+                  Nessuna prenotazione orfana trovata nel sistema! Ottimo lavoro!
+                </div>
+              ) : (
+                <>
+                  <div className="bg-amber-50 border border-amber-100 p-3 rounded-xl text-xs font-bold text-amber-700">
+                    Trovate {orphanBookings.length} prenotazioni orfane. Conferma l'eliminazione per liberare i posti sulla mappa.
+                  </div>
+                  <div className="max-h-60 overflow-y-auto border border-slate-100 rounded-xl divide-y divide-slate-100">
+                    {orphanBookings.map((b) => (
+                      <div key={b.id} className="p-3 flex items-center justify-between hover:bg-slate-50 transition-colors">
+                        <div className="space-y-0.5">
+                          <span className="text-xs font-black text-slate-700 block">
+                            {b.customerName || "Cliente sconosciuto"}
+                          </span>
+                          <span className="text-[10px] font-bold text-slate-400">
+                            ID Booking: {b.id}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span className="px-2 py-0.5 bg-slate-100 border border-slate-200 text-slate-600 text-[10px] font-extrabold rounded-md">
+                            Lettino: {b.bedNumber}
+                          </span>
+                          <span className="px-2 py-0.5 bg-amber-100 text-amber-800 text-[10px] font-black rounded-md">
+                            Data: {formatItalianDate(b.date)}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setShowBonificaModal(false)}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl transition-all cursor-pointer"
+              >
+                Annulla
+              </button>
+              {orphanBookings.length > 0 && (
+                <button
+                  type="button"
+                  id="btn-confirm-bonifica"
+                  onClick={handleExecuteBonifica}
+                  disabled={saving}
+                  className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-xs rounded-xl flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>{saving ? "Eliminazione..." : `Elimina ${orphanBookings.length} prenotazioni orfane`}</span>
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -3883,6 +5095,311 @@ export default function SubscriptionsModule({
                 className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white text-xs font-bold rounded-xl shadow-sm transition-all cursor-pointer"
               >
                 {saving ? "Generazione in corso..." : "Conferma e Salva Abbonamento"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 8. PRINT SUBSCRIBERS MODAL */}
+      {showPrintModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-xl max-w-md w-full space-y-4">
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="font-bold text-sm text-slate-800 flex items-center gap-1.5">
+                <Printer className="w-4 h-4 text-emerald-700" />
+                <span>Stampa Elenco Abbonati</span>
+              </h3>
+              <button 
+                onClick={() => setShowPrintModal(false)} 
+                className="text-slate-400 hover:text-slate-600 font-bold text-sm cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              {/* Date Filters */}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase block">Data Inizio *</label>
+                  <input
+                    id="print-start-date"
+                    type="date"
+                    required
+                    value={printStartDate}
+                    onChange={(e) => setPrintStartDate(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-100 rounded-xl text-xs focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-500 transition-all"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase block">Data Fine *</label>
+                  <input
+                    id="print-end-date"
+                    type="date"
+                    required
+                    value={printEndDate}
+                    onChange={(e) => setPrintEndDate(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-100 rounded-xl text-xs focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-500 transition-all"
+                  />
+                </div>
+              </div>
+
+              {/* Pedana Selection */}
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-bold text-slate-500 uppercase block">Pedana / Settore</label>
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setPrintPedana("sinistra")}
+                    className={`px-3 py-2 text-xs font-bold rounded-xl border transition-all cursor-pointer ${
+                      printPedana === "sinistra"
+                        ? "bg-emerald-700 border-emerald-700 text-white shadow-sm"
+                        : "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    Sinistra (1-34)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPrintPedana("destra")}
+                    className={`px-3 py-2 text-xs font-bold rounded-xl border transition-all cursor-pointer ${
+                      printPedana === "destra"
+                        ? "bg-emerald-700 border-emerald-700 text-white shadow-sm"
+                        : "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    Destra (60+)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPrintPedana("entrambe")}
+                    className={`px-3 py-2 text-xs font-bold rounded-xl border transition-all cursor-pointer ${
+                      printPedana === "entrambe"
+                        ? "bg-emerald-700 border-emerald-700 text-white shadow-sm"
+                        : "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    Entrambe
+                  </button>
+                </div>
+              </div>
+
+              <div className="bg-slate-50 border border-slate-100/80 p-3 rounded-xl text-[10px] text-slate-500 space-y-1">
+                <span className="font-bold block text-slate-700">Nota sulla generazione:</span>
+                <p>
+                  Verranno estratti tutti gli abbonamenti con date attive sovrapposte all'intervallo indicato. Gli abbonati con letti multipli avranno righe distinte, ordinate per numero letto.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowPrintModal(false)}
+                className="px-4 py-2 border border-slate-200 text-slate-500 text-xs font-bold rounded-xl hover:bg-slate-50 cursor-pointer"
+              >
+                Annulla
+              </button>
+              <button
+                type="button"
+                id="btn-print-generate-pdf"
+                onClick={handleGeneratePDF}
+                className="px-5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-xl shadow-sm transition-all cursor-pointer"
+              >
+                Genera PDF
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 9. BULK IMPORT SUBSCRIBERS MODAL */}
+      {showBulkImportModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-xl max-w-4xl w-full max-h-[90vh] flex flex-col space-y-4">
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3 shrink-0">
+              <h3 className="font-bold text-sm text-slate-800 flex items-center gap-1.5">
+                <Users className="w-4 h-4 text-[#025A70]" />
+                <span>Importazione Massiva Abbonati (Bulk Import)</span>
+              </h3>
+              <button 
+                onClick={() => {
+                  setShowBulkImportModal(false);
+                  setBulkInputText("");
+                  setParsedRows([]);
+                  setParsingErrors([]);
+                }} 
+                className="text-slate-400 hover:text-slate-600 font-bold text-sm cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+              {/* Formato Istruzioni */}
+              <div className="bg-slate-50 border border-slate-100/80 p-3 rounded-xl text-xs text-slate-600 space-y-1">
+                <span className="font-bold text-slate-800">Formato di input (una riga per prenotazione):</span>
+                <p className="font-mono text-[10px] bg-slate-100 p-1.5 rounded text-slate-700">
+                  Nome | Letto | DataInizio | DataFine<br />
+                  Esempio:<br />
+                  Andrea Rugeri | 90 | 2026-07-12 | 2026-07-12<br />
+                  Arditi | 66 | 2026-07-11 | 2026-07-17
+                </p>
+                <p className="text-[10px] text-slate-500">
+                  Nota: Se un cliente ha più letti o periodi, inserisci più righe con lo stesso nome. Verrà creato un unico record cliente e più abbonamenti associati.
+                </p>
+              </div>
+
+              {/* Textarea for Input */}
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold text-slate-500 uppercase block">Incolla qui l'elenco abbonati</label>
+                <textarea
+                  id="bulk-import-textarea"
+                  rows={6}
+                  value={bulkInputText}
+                  onChange={(e) => setBulkInputText(e.target.value)}
+                  placeholder="Incolla qui..."
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-100 rounded-xl text-xs font-mono focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-500 transition-all"
+                />
+              </div>
+
+              {/* Analyze Button */}
+              <div className="flex justify-start">
+                <button
+                  type="button"
+                  id="btn-bulk-import-analyze"
+                  onClick={handleAnalyzeBulk}
+                  className="px-4 py-2 bg-[#025A70] hover:bg-[#014152] text-white text-xs font-bold rounded-xl shadow-sm transition-all cursor-pointer"
+                >
+                  Analizza dati
+                </button>
+              </div>
+
+              {/* Parsing Errors Display */}
+              {parsingErrors.length > 0 && (
+                <div className="bg-rose-50 border border-rose-100 p-4 rounded-xl space-y-2">
+                  <div className="flex items-center gap-1.5 text-rose-700 font-bold text-xs">
+                    <AlertCircle className="w-4 h-4" />
+                    <span>Errori di formattazione o validazione:</span>
+                  </div>
+                  <ul className="list-disc list-inside text-[11px] text-rose-600 space-y-1 max-h-40 overflow-y-auto">
+                    {parsingErrors.map((err, i) => (
+                      <li key={i}>{err}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Preview Table */}
+              {parsedRows.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[11px] font-bold text-slate-500 uppercase">Anteprima Importazione ({parsedRows.length} righe rilevate)</span>
+                    
+                    {/* Checkbox Importa Comunque */}
+                    {parsedRows.some(r => r.conflict) && (
+                      <label className="flex items-center gap-2 text-xs font-bold text-amber-700 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={ignoreConflicts}
+                          onChange={(e) => setIgnoreConflicts(e.target.checked)}
+                          className="rounded border-amber-300 text-amber-600 focus:ring-amber-500"
+                        />
+                        <span>Importa comunque ignorando i conflitti</span>
+                      </label>
+                    )}
+                  </div>
+
+                  <div className="border border-slate-100 rounded-xl overflow-hidden overflow-x-auto max-h-80">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-slate-50 text-slate-500 uppercase text-[10px] font-bold border-b border-slate-100">
+                          <th className="p-3 text-center w-12">Riga</th>
+                          <th className="p-3">Nome Cliente</th>
+                          <th className="p-3 text-center w-20">Letto</th>
+                          <th className="p-3">Periodo</th>
+                          <th className="p-3">Stato Cliente</th>
+                          <th className="p-3">Stato Letto</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {parsedRows.map((row) => (
+                          <tr 
+                            key={row.lineNum} 
+                            className={`transition-colors ${
+                              row.conflict 
+                                ? "bg-rose-50/70 hover:bg-rose-50 text-rose-900" 
+                                : "hover:bg-slate-50 text-slate-700"
+                            }`}
+                          >
+                            <td className="p-3 text-center font-mono text-[10px] text-slate-400">{row.lineNum}</td>
+                            <td className="p-3 font-medium">{row.customerName}</td>
+                            <td className="p-3 text-center font-bold">{row.bedNumber}</td>
+                            <td className="p-3 font-mono text-[11px]">{row.startDate} &rarr; {row.endDate}</td>
+                            <td className="p-3">
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold ${
+                                row.status === "Nuovo cliente"
+                                  ? "bg-blue-50 text-blue-700 border border-blue-100"
+                                  : "bg-slate-100 text-slate-600 border border-slate-200"
+                              }`}>
+                                {row.status}
+                              </span>
+                            </td>
+                            <td className="p-3">
+                              {row.conflict ? (
+                                <span className="text-[10px] font-bold text-rose-600 flex items-center gap-1">
+                                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                                  <span>CONFLITTO: {row.conflictReason}</span>
+                                </span>
+                              ) : (
+                                <span className="text-[10px] font-bold text-emerald-600 flex items-center gap-1">
+                                  <Check className="w-3.5 h-3.5 shrink-0" />
+                                  <span>Libero</span>
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-3 pt-3 border-t border-slate-100 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowBulkImportModal(false);
+                  setBulkInputText("");
+                  setParsedRows([]);
+                  setParsingErrors([]);
+                }}
+                className="px-4 py-2 border border-slate-200 text-slate-500 text-xs font-bold rounded-xl hover:bg-slate-50 cursor-pointer"
+              >
+                Annulla
+              </button>
+              <button
+                type="button"
+                id="btn-bulk-import-confirm"
+                disabled={isImporting || parsedRows.length === 0 || (parsedRows.some(r => r.conflict) && !ignoreConflicts)}
+                onClick={handleConfirmBulkImport}
+                className={`px-5 py-2 text-white text-xs font-bold rounded-xl shadow-sm transition-all flex items-center gap-1.5 ${
+                  isImporting || parsedRows.length === 0 || (parsedRows.some(r => r.conflict) && !ignoreConflicts)
+                    ? "bg-slate-300 cursor-not-allowed text-slate-400"
+                    : "bg-emerald-700 hover:bg-emerald-800 cursor-pointer"
+                }`}
+              >
+                {isImporting ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>Importazione in corso...</span>
+                  </>
+                ) : (
+                  <span>Conferma Importazione</span>
+                )}
               </button>
             </div>
           </div>

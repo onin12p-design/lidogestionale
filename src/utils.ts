@@ -1,3 +1,5 @@
+import { Booking, BookingSlot } from "./types";
+
 /**
  * Returns the current date in Europe/Rome timezone in YYYY-MM-DD format.
  */
@@ -384,6 +386,103 @@ export function toNumberOr(value: any, fallback: number): number {
   if (value === null || value === undefined) return fallback;
   const num = Number(value);
   return isNaN(num) ? fallback : num;
+}
+
+/**
+ * Checks if two slots conflict according to the rule:
+ * - full_day conflicts with everything
+ * - morning conflicts with morning and full_day
+ * - afternoon conflicts with afternoon and full_day
+ */
+export function slotsConflict(s1: string, s2: string): boolean {
+  if (s1 === "full_day" || s2 === "full_day") return true;
+  return s1 === s2;
+}
+
+/**
+ * Standardized single booking generation helper for subscriptions.
+ */
+export function buildSubscriptionBooking({
+  dt,
+  bNum,
+  sub,
+  customer,
+  bedsConfig
+}: {
+  dt: string;
+  bNum: number;
+  sub: any;
+  customer: any;
+  bedsConfig: any;
+}): Booking {
+  const slotKey = sub.slot === "full_day" ? "full" : sub.slot;
+  const bookingId = `${dt}_${bNum}_${slotKey}_${sub.id}`;
+  const subItems = getSubscriptionItemsForBooking(bNum, sub.slotTypeId, [], bedsConfig);
+  const risorse = [{ postazione: bNum, items: subItems }];
+
+  return {
+    id: bookingId,
+    bedNumber: bNum,
+    date: dt,
+    slot: sub.slot as BookingSlot,
+    tipoPrenotazione: "intera",
+    risorse,
+    customerId: sub.customerId,
+    customerName: customer.name,
+    customerPhone: customer.phone || "",
+    customerType: "subscriber",
+    subscriptionId: sub.id,
+    source: "subscription",
+    notes: "",
+    isConfirmedPayPerDay: customer.dealType === "pay_per_day" ? false : true,
+    dealType: customer.dealType,
+    createdAt: new Date().toISOString()
+  };
+}
+
+/**
+ * Checks if two bookings conflict (same date, overlapping slot, and sharing any specific resource items).
+ */
+export function areBookingsConflicting(b1: any, b2: any, bedsConfig?: Record<number, number>): boolean {
+  if (b1.date !== b2.date) return false;
+
+  // 1. Check slot overlap
+  const slotA = b1.tipoPrenotazione === "abbonato" ? "full_day" : b1.slot;
+  const slotB = b2.tipoPrenotazione === "abbonato" ? "full_day" : b2.slot;
+  let slotsOverlap = false;
+  if (slotA === "full_day" || slotB === "full_day") {
+    slotsOverlap = true;
+  } else {
+    slotsOverlap = slotA === slotB;
+  }
+
+  if (!slotsOverlap) return false;
+
+  // 2. Identify the postazioni involved
+  const postazioni1 = b1.risorse && b1.risorse.length > 0
+    ? b1.risorse.map((r: any) => r.postazione)
+    : [b1.bedNumber];
+
+  const postazioni2 = b2.risorse && b2.risorse.length > 0
+    ? b2.risorse.map((r: any) => r.postazione)
+    : [b2.bedNumber];
+
+  // Find overlapping postazioni
+  const commonPostazioni = postazioni1.filter((p: number) => postazioni2.includes(p));
+  if (commonPostazioni.length === 0) return false;
+
+  // 3. For each overlapping postazione, check if they share any specific items
+  for (const postazione of commonPostazioni) {
+    const items1 = getOccupiedItemsForBooking(b1, postazione, bedsConfig);
+    const items2 = getOccupiedItemsForBooking(b2, postazione, bedsConfig);
+
+    const hasCommonItem = items1.some((item: string) => items2.includes(item));
+    if (hasCommonItem) {
+      return true; // Conflict!
+    }
+  }
+
+  return false;
 }
 
 

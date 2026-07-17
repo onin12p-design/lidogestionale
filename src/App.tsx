@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { signInAnonymously } from "firebase/auth";
+import { signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from "firebase/auth";
 import { auth, db, collection, query, where, onSnapshot, doc, setDoc, offlineModeState } from "./lib/firebase";
 import { getRomeTodayString, formatItalianDate } from "./utils";
 import { Booking, Tab, Payment, Subscription, Customer, LedgerEntry, Attendance } from "./types";
@@ -33,9 +33,7 @@ export default function App() {
 
   // Routing and Staff Authentication states (C)
   const [path, setPath] = useState(window.location.pathname);
-  const [isLoggedStaff, setIsLoggedStaff] = useState(() => {
-    return localStorage.getItem("samarinda_logged_staff") === "true";
-  });
+  const [isLoggedStaff, setIsLoggedStaff] = useState(false);
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState<string | null>(null);
 
@@ -85,21 +83,41 @@ export default function App() {
     setCurrentDate(getRomeTodayString());
   }, []);
 
-  // 1. Authenticate Staff Anonymously on Mount
+  // 1. Authenticate Staff using real-time Auth State listener on Mount
   useEffect(() => {
     setAuthLoading(true);
-    signInAnonymously(auth)
-      .then(() => {
-        setIsAuth(true);
-        setAuthError(false);
-        setAuthLoading(false);
-      })
-      .catch((error) => {
-        console.error("Firebase anonymous auth failed:", error);
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        try {
+          const tokenResult = await user.getIdTokenResult();
+          if (tokenResult.claims.staff === true) {
+            setIsLoggedStaff(true);
+            setIsAuth(true);
+            setAuthError(false);
+          } else {
+            setIsLoggedStaff(false);
+            setIsAuth(true);
+            setAuthError(false);
+          }
+        } catch (err) {
+          console.error("Errore nel recupero dei claims del token:", err);
+          setIsLoggedStaff(false);
+          setIsAuth(false);
+        }
+      } else {
+        setIsLoggedStaff(false);
         setIsAuth(false);
-        setAuthError(true);
-        setAuthLoading(false);
-      });
+        // Automatically sign in anonymously if there's no session, to preserve public reading
+        signInAnonymously(auth)
+          .catch((error) => {
+            console.error("Firebase anonymous auth failed on mount:", error);
+            setAuthError(true);
+          });
+      }
+      setAuthLoading(false);
+    });
+
+    return () => unsubscribe();
   }, []);
 
   // 2. Real-time Firestore Sync based on currentDate and Auth
@@ -340,18 +358,17 @@ export default function App() {
     e.preventDefault();
     setLoginError(null);
     try {
-      const response = await fetch("/api/staff-login", {
+      const response = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password })
       });
       const data = await response.json();
-      if (data.success) {
-        setIsLoggedStaff(true);
-        localStorage.setItem("samarinda_logged_staff", "true");
+      if (response.ok && data.token) {
+        await signInWithCustomToken(auth, data.token);
         setPassword("");
       } else {
-        setLoginError("Password errata. Riprova.");
+        setLoginError(data.error || "Password errata. Riprova.");
       }
     } catch (err) {
       console.error("Login error:", err);
@@ -359,10 +376,13 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
-    setIsLoggedStaff(false);
-    localStorage.removeItem("samarinda_logged_staff");
-    setPassword("");
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setPassword("");
+    } catch (err) {
+      console.error("Logout error:", err);
+    }
   };
 
   if (authLoading) {

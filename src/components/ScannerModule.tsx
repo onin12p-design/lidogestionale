@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Booking, Customer, BookingSlot, CustomerType } from "../types";
-import { db, handleFirestoreError, OperationType, createBookingTransactional, getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "../lib/firebase";
+import { db, handleFirestoreError, OperationType, createBookingTransactional, getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc, auth } from "../lib/firebase";
 import { isValidBedNumber, sanitizeForFirestore } from "../utils";
 import { Upload, AlertTriangle, Check, Trash2, Plus, Sparkles, Loader2 } from "lucide-react";
 
@@ -47,8 +47,15 @@ export default function ScannerModule({ currentDate, existingBookings, onImportC
     }
 
     try {
+      const token = await auth.currentUser?.getIdToken();
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
       const response = await fetch("/api/parse-scanner", {
         method: "POST",
+        headers,
         body: formData
       });
 

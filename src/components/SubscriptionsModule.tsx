@@ -7,7 +7,9 @@ import {
   getBedLettiniCount,
   getBedItems,
   getOccupiedItemsForBooking,
-  getSubscriptionItemsForBooking
+  getSubscriptionItemsForBooking,
+  slotsConflict,
+  buildSubscriptionBooking
 } from "../utils";
 import { 
   Subscription, 
@@ -1459,33 +1461,19 @@ export default function SubscriptionsModule({
             }
           }
 
-          // Create Booking using deterministic ID with subscription ID suffix
-          const slotKey = subData.slot === "full_day" ? "full" : subData.slot;
-          const bookingId = `${dt}_${bNum}_${slotKey}_${subRef.id}`;
-          const bookingRef = doc(db, "bookings", bookingId);
-
-          const dayBookings = bookings.filter(b => b.date === dt && b.bedNumber === bNum);
-          const subItems = getSubscriptionItemsForBooking(bNum, subData.slotTypeId, dayBookings, bedsConfig);
-          const risorse = [{ postazione: bNum, items: subItems }];
-
-          const finalBooking: Booking = {
-            id: bookingId,
-            bedNumber: bNum,
-            date: dt,
-            slot: subData.slot,
-            tipoPrenotazione: "intera",
-            risorse: risorse,
-            customerId: subData.customerId,
-            customerName: customer.name,
-            customerPhone: customer.phone || "",
-            customerType: "subscriber",
-            subscriptionId: subRef.id,
-            source: "subscription",
-            notes: "",
-            isConfirmedPayPerDay: customer.dealType === "pay_per_day" ? false : true,
-            dealType: customer.dealType,
-            createdAt: new Date().toISOString()
-          };
+          const finalBooking = buildSubscriptionBooking({
+            dt,
+            bNum,
+            sub: {
+              id: subRef.id,
+              slot: subData.slot,
+              slotTypeId: subData.slotTypeId,
+              customerId: subData.customerId
+            },
+            customer,
+            bedsConfig
+          });
+          const bookingRef = doc(db, "bookings", finalBooking.id);
 
           batch.set(bookingRef, sanitizeForFirestore(finalBooking));
           opCount++;
@@ -1883,7 +1871,12 @@ export default function SubscriptionsModule({
         id: d.id,
         ...d.data()
       }));
-      const subBookings = allBookings.filter(b => b.subscriptionId && b.subscriptionId.trim() !== "");
+      const subBookings = allBookings.filter(b => 
+        (b.subscriptionId && b.subscriptionId.trim() !== "") || 
+        b.source === "subscription" || 
+        b.customerType === "subscriber" ||
+        (b as any).tipoPrenotazione === "abbonato"
+      );
 
       // 2. Fetch all subscriptions
       const subsSnap: any = await getDocs(collection(db, "subscriptions"));
@@ -1893,8 +1886,9 @@ export default function SubscriptionsModule({
       }));
       const subsMap = new Map(subsList.map(s => [s.id, s]));
 
-      // 3. Find orphans (either subscription doesn't exist, or exists but is cancelled)
+      // 3. Find orphans (linked subscription is missing, doesn't exist, or is cancelled)
       const orphans = subBookings.filter(b => {
+        if (!b.subscriptionId || b.subscriptionId.trim() === "") return true;
         const refSub = subsMap.get(b.subscriptionId) as any;
         if (!refSub) return true; // Does not exist
         if (refSub.status === "cancelled") return true; // Cancelled
@@ -2242,30 +2236,15 @@ export default function SubscriptionsModule({
             continue;
           }
 
-          const subItems = getSubscriptionItemsForBooking(bNum, sub.slotTypeId, [], bedsConfig);
-          const risorse = [{ postazione: bNum, items: subItems }];
-          const slotKey = sub.slot === "full_day" ? "full" : sub.slot;
-          const bookingId = `${dt}_${bNum}_${slotKey}_${sub.id}`;
-
-          toCreate.push({
-            id: bookingId,
-            bedNumber: bNum,
-            date: dt,
-            slot: sub.slot,
-            tipoPrenotazione: "intera",
-            risorse,
-            customerId: sub.customerId,
-            customerName: customer.name,
-            customerPhone: customer.phone || "",
-            customerType: "subscriber",
-            subscriptionId: sub.id,
-            source: "subscription",
-            notes: "",
-            origine: "allineamento",
-            isConfirmedPayPerDay: customer.dealType === "pay_per_day" ? false : true,
-            dealType: customer.dealType || "seasonal",
-            createdAt: new Date().toISOString()
+          const finalBooking = buildSubscriptionBooking({
+            dt,
+            bNum,
+            sub,
+            customer,
+            bedsConfig
           });
+          (finalBooking as any).origine = "allineamento";
+          toCreate.push(finalBooking);
         }
       }
     }

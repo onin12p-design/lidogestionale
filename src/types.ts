@@ -1,7 +1,7 @@
 export type CustomerType = "daily" | "subscriber";
 export type BookingSlot = "morning" | "afternoon" | "full_day";
 export type SubscriptionStatus = "active" | "expired" | "cancelled";
-export type PaymentMethod = "cash" | "card";
+export type PaymentMethod = "cash" | "card" | "hotel_conv" | "conv_hotel";
 export type PaymentKind = "full" | "deposit";
 export type BookingSource = "manual" | "scanner" | "subscription";
 

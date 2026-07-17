@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { MessageSquare, Send, Sparkles, Loader2, Edit3, Check, Trash2, Paperclip, FileText, Plus, AlertCircle, RefreshCw, X } from "lucide-react";
-import { runTransaction, db, collection, doc, query, where, getDocs, onSnapshot, setDoc, deleteDoc } from "../lib/firebase";
+import { runTransaction, db, collection, doc, query, where, getDocs, onSnapshot, setDoc, deleteDoc, auth } from "../lib/firebase";
 
 interface ProposalData {
   type: "subscription" | "daily_map";
@@ -225,8 +225,15 @@ export default function AIAssistantModule() {
     formData.append("file", file);
 
     try {
+      const token = await auth.currentUser?.getIdToken();
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
       const res = await fetch("/api/ai-assistant/upload-and-ingest", {
         method: "POST",
+        headers,
         body: formData
       });
       const data = await res.json();
@@ -313,9 +320,15 @@ Puoi ora interrogarmi direttamente su questi dati!`;
         }, { merge: true });
       }
 
+      const token = await auth.currentUser?.getIdToken();
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
       const res = await fetch("/api/ai-assistant", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ message: currentText, sessionId })
       });
 

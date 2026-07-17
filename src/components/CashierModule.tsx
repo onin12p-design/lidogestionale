@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Booking, Tab, Payment, PaymentMethod, PaymentKind, TabItem } from "../types";
-import { db, handleFirestoreError, OperationType, getFirestore, setDoc, doc, collection, addDoc, getDocs, writeBatch, serverTimestamp } from "../lib/firebase";
+import { db, handleFirestoreError, OperationType, getFirestore, setDoc, doc, collection, addDoc, getDocs, writeBatch, serverTimestamp, runTransaction } from "../lib/firebase";
 import { sanitizeForFirestore, getPriceForBooking, getBookingPriceProportional } from "../utils";
 import { Coffee, CreditCard, Euro, CheckCircle, Search, Clock, AlertTriangle, Plus, Trash } from "lucide-react";
 
@@ -64,11 +64,20 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
     const todayPayments = payments.filter((p) => {
       if (!p.date) return false;
       const d = p.date.seconds ? new Date(p.date.seconds * 1000) : new Date(p.date);
-      return d >= startOfToday && d <= endOfToday;
+      const isToday = d >= startOfToday && d <= endOfToday;
+      if (!isToday) return false;
+
+      // Filter out payments related to subscription-based bookings
+      const relatedBooking = bookings.find((b) => b.id === p.bookingId);
+      if (relatedBooking && isSubscriptionBooking(relatedBooking)) {
+        return false;
+      }
+      return true;
     });
 
     const cashTotal = todayPayments.filter((p) => p.method === "cash").reduce((sum, p) => sum + p.amount, 0);
     const cardTotal = todayPayments.filter((p) => p.method === "card").reduce((sum, p) => sum + p.amount, 0);
+    const hotelConvTotal = todayPayments.filter((p) => p.method === "hotel_conv" || p.method === "conv_hotel").reduce((sum, p) => sum + p.amount, 0);
 
     // Outstanding balances for today's bookings
     let pendingBeds = 0;
@@ -90,6 +99,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
     return {
       cashTotal,
       cardTotal,
+      hotelConvTotal,
       grandTotal: cashTotal + cardTotal,
       pendingBeds,
       pendingTabs,
@@ -154,6 +164,28 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
 
   const pendingItems = getPendingItemsList();
 
+  const handlePayAmountChange = (val: number) => {
+    setPayAmount(val);
+    if (selectedBookingForPay) {
+      const basePrice = selectedBookingForPay.isHotel
+        ? 0
+        : getBookingPriceProportional(selectedBookingForPay, pricingConfigs, bedsConfig, rowsConfig);
+      const computedDiscount = Math.max(0, basePrice - val);
+      setPayDiscount(computedDiscount);
+    }
+  };
+
+  const handlePayDiscountChange = (val: number) => {
+    setPayDiscount(val);
+    if (selectedBookingForPay) {
+      const basePrice = selectedBookingForPay.isHotel
+        ? 0
+        : getBookingPriceProportional(selectedBookingForPay, pricingConfigs, bedsConfig, rowsConfig);
+      const computedAmount = Math.max(0, basePrice - val);
+      setPayAmount(computedAmount);
+    }
+  };
+
   // Register payment for daily booking
   const handleRecordPayment = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -161,25 +193,31 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
 
     setSaving(true);
     try {
-      const paymentId = `pay_${Date.now()}`;
+      const paymentId = doc(collection(db, "payments")).id;
       const paymentRef = doc(db, "payments", paymentId);
+      const bookingRef = doc(db, "bookings", selectedBookingForPay.id);
 
-      await setDoc(paymentRef, sanitizeForFirestore({
-        customerId: selectedBookingForPay.customerId || "",
-        bookingId: selectedBookingForPay.id,
-        amount: payAmount,
-        method: payMethod,
-        kind: payKind,
-        date: serverTimestamp(),
-        operator: "Staff",
-        dateStr: currentDate
-      }));
+      await runTransaction(db, async (transaction) => {
+        // Read the booking first to meet transaction safety requirements
+        await transaction.get(bookingRef);
 
-      if (payDiscount > 0) {
-        await setDoc(doc(db, "bookings", selectedBookingForPay.id), { sconto: payDiscount }, { merge: true });
-        setPayDiscount(0);
-      }
+        // 1. Create the payment
+        transaction.set(paymentRef, sanitizeForFirestore({
+          customerId: selectedBookingForPay.customerId || "",
+          bookingId: selectedBookingForPay.id,
+          amount: payAmount,
+          method: payMethod,
+          kind: payKind,
+          date: serverTimestamp(),
+          operator: "Staff",
+          dateStr: currentDate
+        }));
 
+        // 2. Set sconto on the booking
+        transaction.set(bookingRef, { sconto: payDiscount }, { merge: true });
+      });
+
+      setPayDiscount(0);
       setSelectedBookingForPay(null);
       setPayAmount(0);
       onRefresh();
@@ -246,7 +284,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
       }));
 
       // 2. Write a payment for this tab
-      const paymentId = `pay_tab_${Date.now()}`;
+      const paymentId = doc(collection(db, "payments")).id;
       const paymentRef = doc(db, "payments", paymentId);
 
       await setDoc(paymentRef, sanitizeForFirestore({
@@ -311,6 +349,13 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
               <span className="text-[10px] font-bold text-slate-500 uppercase block mb-1">Incasso Totale</span>
               <span className="text-2xl font-black text-slate-800">{summary.grandTotal} €</span>
             </div>
+
+            {summary.hotelConvTotal > 0 && (
+              <div className="col-span-2 bg-[#E7F3F6] border border-[#BCE1E9] p-4 rounded-xl">
+                <span className="text-[10px] font-bold text-[#025A70] uppercase block mb-1">Convenzioni Hotel (Conv/Hotel)</span>
+                <span className="text-xl font-black text-[#013440]">{summary.hotelConvTotal} €</span>
+              </div>
+            )}
           </div>
 
           <div className="bg-rose-50/50 border border-rose-100 p-4 rounded-xl space-y-1">
@@ -399,8 +444,9 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
                             id={`btn-pay-pending-${idx}`}
                             onClick={() => {
                               setSelectedBookingForPay(item.booking);
+                              const currentDiscount = (item.booking as any).sconto || 0;
                               setPayAmount(item.amount);
-                              setPayDiscount((item.booking as any).sconto || 0);
+                              setPayDiscount(currentDiscount);
                             }}
                             className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[10px] font-bold uppercase px-2 py-1 rounded border border-emerald-200 transition-all"
                           >
@@ -462,6 +508,37 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
             </div>
 
             <form id="form-quick-pay" onSubmit={handleRecordPayment} className="space-y-4">
+              {(() => {
+                const basePrice = selectedBookingForPay.isHotel
+                  ? 0
+                  : getBookingPriceProportional(selectedBookingForPay, pricingConfigs, bedsConfig, rowsConfig);
+                const finance = getBookingFinance(selectedBookingForPay);
+                return (
+                  <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/60 space-y-1 text-xs text-slate-600 font-sans">
+                    <div className="flex justify-between">
+                      <span>Prezzo listino atteso:</span>
+                      <span className="font-bold text-slate-800">{basePrice} €</span>
+                    </div>
+                    {finance.paidSum > 0 && (
+                      <div className="flex justify-between">
+                        <span>Già pagato (acconto):</span>
+                        <span className="font-bold text-emerald-600">-{finance.paidSum} €</span>
+                      </div>
+                    )}
+                    {payDiscount > 0 && (
+                      <div className="flex justify-between">
+                        <span>Sconto applicato:</span>
+                        <span className="font-bold text-rose-600">-{payDiscount} €</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between pt-1 border-t border-slate-200 font-bold text-slate-800">
+                      <span>Totale residuo da pagare:</span>
+                      <span className="text-[#025A70]">{Math.max(0, basePrice - finance.paidSum - payDiscount)} €</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
               <div>
                 <label className="block text-xs font-semibold text-slate-600 mb-1">Importo (€)</label>
                 <input
@@ -469,7 +546,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
                   type="number"
                   required
                   value={payAmount}
-                  onChange={(e) => setPayAmount(Number(e.target.value))}
+                  onChange={(e) => handlePayAmountChange(Number(e.target.value))}
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold"
                 />
               </div>
@@ -480,7 +557,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
                   id="pay-discount-quick"
                   type="number"
                   value={payDiscount}
-                  onChange={(e) => setPayDiscount(Number(e.target.value))}
+                  onChange={(e) => handlePayDiscountChange(Number(e.target.value))}
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm"
                   placeholder="0"
                 />
@@ -497,6 +574,7 @@ export default function CashierModule({ currentDate, bookings, tabs, payments, p
                   >
                     <option value="cash">Contanti</option>
                     <option value="card">Carta/POS</option>
+                    <option value="conv_hotel">Conv/Hotel</option>
                   </select>
                 </div>
                 <div>

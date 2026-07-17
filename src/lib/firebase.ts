@@ -17,7 +17,7 @@ import {
 } from "firebase/firestore";
 import firebaseConfig from "../../firebase-applet-config.json";
 import { Booking } from "../types";
-import { sanitizeForFirestore, getBedLettiniCount, getBedItems, hasConflict } from "../utils";
+import { sanitizeForFirestore, getBedLettiniCount, getBedItems, hasConflict, areBookingsConflicting } from "../utils";
 
 // Initialize Firebase App
 const app = initializeApp(firebaseConfig);
@@ -804,32 +804,14 @@ export async function createBookingTransactional(booking: Omit<Booking, "id" | "
         ? booking.risorse
         : [{ postazione: bed, items: defaultItems }];
 
-      for (const res of risorse) {
-        const bedNum = res.postazione;
-        for (const item of res.items) {
-          const itemBookings: any[] = [];
-          
-          existingBookings.forEach((eb) => {
-            let ebItems: string[] = [];
-            if (eb.risorse && eb.risorse.length > 0) {
-              const ebRes = eb.risorse.find((r) => r.postazione === bedNum);
-              if (ebRes) {
-                ebItems = ebRes.items;
-              }
-            } else {
-              if (eb.bedNumber === bedNum) {
-                const ebNumLettini = getBedLettiniCount(bedNum, bedsConfig);
-                ebItems = getBedItems(bedNum, ebNumLettini);
-              }
-            }
-            if (ebItems.includes(item)) {
-              itemBookings.push(eb);
-            }
-          });
+      const candidateBooking = {
+        ...booking,
+        risorse
+      };
 
-          if (hasConflict(itemBookings, slot, item, res.items)) {
-            throw new Error(`Conflitto sulla postazione ${bedNum}, risorsa '${item === 'ombrellone' ? 'ombrellone' : 'lettino'}' già occupata per la fascia selezionata.`);
-          }
+      for (const eb of existingBookings) {
+        if (areBookingsConflicting(candidateBooking, eb, bedsConfig)) {
+          throw new Error(`La risorsa (ombrellone o lettino specifico) è già occupata da un'altra prenotazione attiva.`);
         }
       }
 

@@ -48,6 +48,65 @@ function isWeekend(dateStr) {
   return dayOfWeek === 0 || dayOfWeek === 6;
 }
 
+function parseItalianDateToYYYYMMDD(italianStr) {
+  if (!italianStr) return null;
+  const normalized = italianStr.toLowerCase().replace(/,/g, " ").trim();
+  const parts = normalized.split(/\s+/);
+  
+  const ITALIAN_MONTHS = [
+    "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+    "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"
+  ];
+  
+  let day = null;
+  let month = null;
+  let year = null;
+  
+  for (const part of parts) {
+    if (/^\d{4}$/.test(part)) {
+      year = parseInt(part, 10);
+    } else if (/^\d{1,2}$/.test(part)) {
+      if (day === null) {
+        day = parseInt(part, 10);
+      }
+    } else {
+      const idx = ITALIAN_MONTHS.indexOf(part);
+      if (idx !== -1) {
+        month = idx + 1;
+      }
+    }
+  }
+  
+  if (day !== null && month !== null && year !== null) {
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+  return null;
+}
+
+function getWaivedDatesForSub(subId, ledger) {
+  const waivedDates = new Set();
+  const subLedger = ledger.filter(l => l.subscriptionId === subId && l.kind === "day_waiver_credit");
+  for (const entry of subLedger) {
+    if (entry.note && entry.note.startsWith("Rinuncia ")) {
+      let clean = entry.note.replace("Rinuncia ", "");
+      const parenIdx = clean.indexOf("(");
+      if (parenIdx !== -1) {
+        clean = clean.substring(0, parenIdx).trim();
+      }
+      const dateParts = clean.split(" - ");
+      if (dateParts.length === 2) {
+        const startYMD = parseItalianDateToYYYYMMDD(dateParts[0]);
+        const endYMD = parseItalianDateToYYYYMMDD(dateParts[1]);
+        if (startYMD && endYMD) {
+          const rangeDates = getDatesInRange(startYMD, endYMD);
+          rangeDates.forEach(d => waivedDates.add(d));
+        }
+      }
+    }
+  }
+  return waivedDates;
+}
+
 // Get list of bed items
 function getBedItems(bNum) {
   // Samarinda standard: postazioni have 2 lettini
@@ -81,6 +140,15 @@ async function run() {
   });
   console.log(`Trovate ${existingSubBookings.length} prenotazioni da abbonamento esistenti.`);
 
+  // Load ledger entries to respect waived dates
+  console.log("Caricamento registro ledger...");
+  const ledgerSnapshot = await getDocs(collection(db, "ledger"));
+  const ledgerList = [];
+  ledgerSnapshot.forEach((docSnap) => {
+    ledgerList.push({ id: docSnap.id, ...docSnap.data() });
+  });
+  console.log(`Trovate ${ledgerList.length} voci ledger.`);
+
   // Index existing bookings by date and bedNumber to help calculate shared resources
   const bookingsByDateAndBed = {};
   existingSubBookings.forEach((b) => {
@@ -100,6 +168,9 @@ async function run() {
     if (sub.soloWeekend) {
       dates = dates.filter(isWeekend);
     }
+
+    const waivedDates = getWaivedDatesForSub(sub.id, ledgerList);
+    dates = dates.filter(d => !waivedDates.has(d));
 
     const beds = sub.bedNumbers || [];
 

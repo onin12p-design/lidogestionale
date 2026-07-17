@@ -940,7 +940,7 @@ export default function DailyMapModule({
                           </div>
 
                           {/* Quick record payment */}
-                          {balance > 0 && booking.source !== "subscription" && (
+                          {balance > 0 && booking.source !== "subscription" && booking.customerType !== "subscriber" && booking.tipoPrenotazione !== "abbonato" && !booking.subscriptionId && (
                             <div className="bg-white p-2.5 rounded-lg border border-slate-100 space-y-2">
                               <span className="text-[9px] font-bold text-slate-400 uppercase block">Registra Pagamento</span>
                               <div className="flex gap-1.5">
@@ -961,6 +961,7 @@ export default function DailyMapModule({
                                 >
                                   <option value="cash">Contanti</option>
                                   <option value="card">Carta</option>
+                                  <option value="conv_hotel">Conv/Hotel</option>
                                 </select>
                                 <button
                                   id={`btn-pay-bed-submit-${booking.id}`}

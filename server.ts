@@ -6,6 +6,7 @@ import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 // @ts-ignore
 import mammoth from "mammoth";
+import admin from "firebase-admin";
 
 // Firebase web imports for server-side API proxying
 import { initializeApp } from "firebase/app";
@@ -16,6 +17,10 @@ import fs from "fs";
 import { promises as fsPromises } from "fs";
 import firebaseConfig from "./firebase-applet-config.json";
 
+// Initialize Firebase Admin SDK
+admin.initializeApp({
+  projectId: firebaseConfig.projectId
+});
 
 dotenv.config();
 
@@ -146,10 +151,62 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-// POST staff login endpoint checking environment variable
+// Authentication middleware for staff
+async function requireStaffAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Accesso negato. Token non fornito." });
+      return;
+    }
+
+    const token = authHeader.split("Bearer ")[1];
+    const decodedToken = await (admin as any).auth().verifyIdToken(token);
+
+    if (decodedToken.staff !== true) {
+      res.status(403).json({ error: "Accesso negato. Permessi non sufficienti." });
+      return;
+    }
+
+    (req as any).user = decodedToken;
+    next();
+  } catch (error: any) {
+    console.error("Errore durante la verifica del token:", error);
+    res.status(401).json({ error: "Accesso negato. Sessione scaduta o non valida.", details: error.message || String(error) });
+  }
+}
+
+// POST staff login generating a Firebase Custom Token
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { password } = req.body;
+    const staffPassword = process.env.STAFF_PASSWORD || process.env.SECRET_STAFF_PASSWORD;
+
+    if (!staffPassword || staffPassword.trim() === "") {
+      console.error("STAFF_PASSWORD and SECRET_STAFF_PASSWORD are not defined");
+      res.status(500).json({ error: "Configurazione del server incompleta (STAFF_PASSWORD mancante)." });
+      return;
+    }
+
+    if (password !== staffPassword) {
+      res.status(401).json({ error: "Password errata." });
+      return;
+    }
+
+    const uid = "staff-operator";
+    const customToken = await (admin as any).auth().createCustomToken(uid, { staff: true });
+
+    res.json({ token: customToken });
+  } catch (error: any) {
+    console.error("Errore generazione Custom Token:", error);
+    res.status(500).json({ error: "Errore durante l'autenticazione.", details: error.message || String(error) });
+  }
+});
+
+// Legacy login for safety
 app.post("/api/staff-login", (req, res) => {
   const { password } = req.body;
-  const staffPassword = process.env.SECRET_STAFF_PASSWORD;
+  const staffPassword = process.env.STAFF_PASSWORD || process.env.SECRET_STAFF_PASSWORD;
   if (!staffPassword || staffPassword.trim() === "") {
     return res.status(500).json({ 
       success: false, 
@@ -164,7 +221,7 @@ app.post("/api/staff-login", (req, res) => {
 });
 
 // GET available Gemini models
-app.get("/api/verify-models", async (req, res) => {
+app.get("/api/verify-models", requireStaffAuth, async (req, res) => {
   try {
     const ai = getGemini();
     const result = await ai.models.list();
@@ -638,7 +695,7 @@ async function parseDocxDeterministic(buffer: Buffer, originalName: string) {
 }
 
 // API endpoint to parse uploaded files using Gemini or deterministic parser
-app.post("/api/parse-scanner", upload.array("files"), async (req, res) => {
+app.post("/api/parse-scanner", requireStaffAuth, upload.array("files"), async (req, res) => {
   try {
     const files = req.files as Express.Multer.File[];
     if (!files || files.length === 0) {
@@ -1035,7 +1092,7 @@ async function processUploadedFile(file: Express.Multer.File, folder: string) {
 }
 
 // Upload endpoint for "Sorgenti"
-app.post("/api/sorgenti/upload", upload.array("files"), async (req, res) => {
+app.post("/api/sorgenti/upload", requireStaffAuth, upload.array("files"), async (req, res) => {
   try {
     const files = req.files as Express.Multer.File[];
     const folder = req.body.folder || "dx/luglio"; // target folder path
@@ -1095,7 +1152,7 @@ app.post("/api/sorgenti/upload", upload.array("files"), async (req, res) => {
 });
 
 // Direct Upload and Ingest endpoint for Chat panel
-app.post("/api/ai-assistant/upload-and-ingest", upload.single("file"), async (req, res) => {
+app.post("/api/ai-assistant/upload-and-ingest", requireStaffAuth, upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
     if (!file) {
@@ -1158,7 +1215,7 @@ app.post("/api/ai-assistant/upload-and-ingest", upload.single("file"), async (re
 });
 
 // List endpoint for "Sorgenti"
-app.get("/api/sorgenti/list", async (req, res) => {
+app.get("/api/sorgenti/list", requireStaffAuth, async (req, res) => {
   try {
     await ensureServerAuth();
     const colRef = collection(db, "sourceDocuments");
@@ -1175,7 +1232,7 @@ app.get("/api/sorgenti/list", async (req, res) => {
 });
 
 // Download endpoint for local fallback
-app.get("/api/sorgenti/download", async (req, res) => {
+app.get("/api/sorgenti/download", requireStaffAuth, async (req, res) => {
   try {
     const { path: filePath } = req.query;
     if (typeof filePath !== "string") {
@@ -1494,7 +1551,7 @@ const proposeDailyMapEntryDeclaration = {
 };
 
 // AI Assistant endpoint using Google Gemini (via @google/genai)
-app.post("/api/ai-assistant", async (req, res) => {
+app.post("/api/ai-assistant", requireStaffAuth, async (req, res) => {
   try {
     const { message, sessionId } = req.body;
     if (!message || !sessionId) {

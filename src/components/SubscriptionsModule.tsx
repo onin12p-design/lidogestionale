@@ -5,7 +5,9 @@ import {
   formatItalianDate, 
   sanitizeForFirestore,
   getBedLettiniCount,
-  getBedItems
+  getBedItems,
+  getOccupiedItemsForBooking,
+  getSubscriptionItemsForBooking
 } from "../utils";
 import { 
   Subscription, 
@@ -60,6 +62,41 @@ interface SubscriptionsModuleProps {
   onRefresh?: () => void;
   preSelectedSubId?: string | null;
   onClearPreSelectedSubId?: () => void;
+}
+
+function parseItalianDateToYYYYMMDD(italianStr: string): string | null {
+  if (!italianStr) return null;
+  const normalized = italianStr.toLowerCase().replace(/,/g, " ").trim();
+  const parts = normalized.split(/\s+/);
+  
+  const ITALIAN_MONTHS = [
+    "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+    "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"
+  ];
+  
+  let day: number | null = null;
+  let month: number | null = null;
+  let year: number | null = null;
+  
+  for (const part of parts) {
+    if (/^\d{4}$/.test(part)) {
+      year = parseInt(part, 10);
+    } else if (/^\d{1,2}$/.test(part)) {
+      if (day === null) {
+        day = parseInt(part, 10);
+      }
+    } else {
+      const idx = ITALIAN_MONTHS.indexOf(part);
+      if (idx !== -1) {
+        month = idx + 1;
+      }
+    }
+  }
+  
+  if (day !== null && month !== null && year !== null) {
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+  return null;
 }
 
 export default function SubscriptionsModule({
@@ -183,6 +220,17 @@ export default function SubscriptionsModule({
   const [showBonificaModal, setShowBonificaModal] = useState(false);
   const [orphanBookings, setOrphanBookings] = useState<any[]>([]);
   const [loadingOrphans, setLoadingOrphans] = useState(false);
+
+  // Alignment states
+  const [showAlignModal, setShowAlignModal] = useState(false);
+  const [alignStartDate, setAlignStartDate] = useState("");
+  const [alignEndDate, setAlignEndDate] = useState("");
+  const [isSimulatingAlign, setIsSimulatingAlign] = useState(false);
+  const [alignResults, setAlignResults] = useState<{
+    alreadyAlignedCount: number;
+    toCreate: any[];
+    conflicts: any[];
+  } | null>(null);
 
   // Daily Presences state & onSnapshot loader
   const [dailyPresences, setDailyPresences] = useState<any[]>([]);
@@ -325,7 +373,8 @@ export default function SubscriptionsModule({
     endDate: string,
     slot: BookingSlot,
     excludeSubId?: string,
-    soloWeekend?: boolean
+    soloWeekend?: boolean,
+    slotTypeId?: string
   ) => {
     let dates = getDatesInRange(startDate, endDate);
     if (soloWeekend) {
@@ -348,21 +397,64 @@ export default function SubscriptionsModule({
       const dayBookings = bookings.filter(
         (b) => b.date === dt && bedNumbers.includes(b.bedNumber)
       );
-      dayBookings.forEach((b) => {
-        if (excludeSubId && b.subscriptionId === excludeSubId) return;
+      
+      bedNumbers.forEach((bNum) => {
+        const bedBookings = dayBookings.filter(b => b.bedNumber === bNum);
+        
+        // Find overlapping bookings on this bed
+        const overlappingBookings = bedBookings.filter(b => {
+          if (excludeSubId && b.subscriptionId === excludeSubId) return false;
+          const slotA = b.tipoPrenotazione === "abbonato" ? "full_day" : b.slot;
+          const slotB = slot;
+          return slotA === "full_day" || slotB === "full_day" || slotA === slotB;
+        });
 
-        const isOverlap =
-          slot === "full_day" ||
-          b.slot === "full_day" ||
-          slot === b.slot;
-        if (isOverlap) {
-          conflicts.push({
-            id: b.id,
-            date: dt,
-            bedNumber: b.bedNumber,
-            slot: b.slot,
-            customer: b.customerName
-          });
+        if (overlappingBookings.length > 0) {
+          // If we are booking a 1LIG subscription
+          if (slotTypeId === "1LIG") {
+            // Count total occupied lettini
+            const occupiedLettini = new Set<string>();
+            overlappingBookings.forEach(ob => {
+              const items = getOccupiedItemsForBooking(ob, bNum, bedsConfig);
+              items.forEach(it => {
+                if (it.startsWith("lettino")) {
+                  occupiedLettini.add(it);
+                }
+              });
+            });
+
+            // A conflict occurs if:
+            // 1. Any overlapping booking occupies the whole postazione
+            // 2. Or both lettini are already occupied
+            const hasWholePostazione = overlappingBookings.some(ob => {
+              const items = getOccupiedItemsForBooking(ob, bNum, bedsConfig);
+              return items.includes("lettino_1") && items.includes("lettino_2");
+            });
+
+            const numL = getBedLettiniCount(bNum, bedsConfig);
+            if (hasWholePostazione || occupiedLettini.size >= numL) {
+              overlappingBookings.forEach(ob => {
+                conflicts.push({
+                  id: ob.id,
+                  date: dt,
+                  bedNumber: bNum,
+                  slot: ob.slot,
+                  customer: ob.customerName
+                });
+              });
+            }
+          } else {
+            // Standard/2LIG booking: any overlapping booking is a conflict
+            overlappingBookings.forEach(ob => {
+              conflicts.push({
+                id: ob.id,
+                date: dt,
+                bedNumber: bNum,
+                slot: ob.slot,
+                customer: ob.customerName
+              });
+            });
+          }
         }
       });
     });
@@ -396,7 +488,7 @@ export default function SubscriptionsModule({
     );
     const custLedger = ledger.filter((l) => l.customerId === customerId);
 
-    // Dovuto = Σ price of active seasonal subscriptions + Σ daily_charge kind ledger entries
+    // Dovuto = Σ price of active seasonal subscriptions + Σ daily_charge kind ledger entries + Σ adjustments
     const subPriceTotal = activeSubs.reduce((sum, s) => {
       const cust = customers.find(c => c.id === customerId);
       if (cust?.dealType === "pay_per_day") return sum; // Type B pays per daily charges instead
@@ -407,7 +499,13 @@ export default function SubscriptionsModule({
       .filter((l) => l.kind === "daily_charge")
       .reduce((sum, l) => sum + l.amount, 0);
 
-    const dovuto = subPriceTotal + dailyChargesTotal;
+    // Semantica dell'adjustment (Ricalcolo/Storno):
+    // L'importo (amount) ha un segno: positivo aumenta il dovuto, negativo lo riduce.
+    const adjustmentsTotal = custLedger
+      .filter((l) => l.kind === "adjustment")
+      .reduce((sum, l) => sum + l.amount, 0);
+
+    const dovuto = subPriceTotal + dailyChargesTotal + adjustmentsTotal;
 
     // Versato = Σ payments + Σ deposits
     const versato = custLedger
@@ -634,41 +732,34 @@ export default function SubscriptionsModule({
     setSuccessMessage(null);
 
     try {
-      await runTransaction(db, async (tx) => {
-        const localNewCustomersMap: { [nameLower: string]: string } = {};
+      const preparedSubscriptions: { subId: string; customerId: string; row: any; subObj: Subscription }[] = [];
+      const localNewCustomersMap: { [nameLower: string]: string } = {};
 
-        for (const row of parsedRows) {
-          const nameLower = row.customerName.toLowerCase().trim();
-          let customerId = "";
+      parsedRows.forEach((row) => {
+        const nameLower = row.customerName.toLowerCase().trim();
+        let customerId = "";
 
-          const existingCust = customers.find(
-            (c) => c.name.toLowerCase().trim() === nameLower
-          );
+        const existingCust = customers.find(
+          (c) => c.name.toLowerCase().trim() === nameLower
+        );
 
-          if (existingCust) {
-            customerId = existingCust.id!;
-          } else if (localNewCustomersMap[nameLower]) {
-            customerId = localNewCustomersMap[nameLower];
-          } else {
-            const newId = `customer_${Math.random().toString(36).substring(2, 11)}`;
-            const customerRef = doc(db, `customers/${newId}`);
-            customerId = newId;
-            localNewCustomersMap[nameLower] = newId;
+        if (existingCust) {
+          customerId = existingCust.id!;
+        } else if (localNewCustomersMap[nameLower]) {
+          customerId = localNewCustomersMap[nameLower];
+        } else {
+          const newId = `customer_${Math.random().toString(36).substring(2, 11)}`;
+          localNewCustomersMap[nameLower] = newId;
+          customerId = newId;
+        }
 
-            const customerData = sanitizeForFirestore({
-              name: row.customerName.trim(),
-              phone: "",
-              notes: "Creato tramite Importazione Massiva",
-              type: "subscriber",
-            });
-
-            tx.set(customerRef, customerData);
-          }
-
-          const subId = `sub_bulk_${Math.random().toString(36).substring(2, 11)}`;
-          const subRef = doc(db, `subscriptions/${subId}`);
-
-          const subscriptionData = sanitizeForFirestore({
+        const subId = `sub_bulk_${Math.random().toString(36).substring(2, 11)}`;
+        preparedSubscriptions.push({
+          subId,
+          customerId,
+          row,
+          subObj: {
+            id: subId,
             customerId,
             customerName: row.customerName.trim(),
             customerPhone: "",
@@ -683,17 +774,51 @@ export default function SubscriptionsModule({
             status: "active",
             notes: "Importazione Massiva",
             createdAt: new Date().toISOString()
-          });
+          }
+        });
+      });
 
-          tx.set(subRef, subscriptionData);
+      await runTransaction(db, async (tx) => {
+        const writtenCustomers = new Set<string>();
+
+        for (const prep of preparedSubscriptions) {
+          if (prep.customerId.startsWith("customer_") && !writtenCustomers.has(prep.customerId)) {
+            const customerRef = doc(db, `customers/${prep.customerId}`);
+            const customerData = sanitizeForFirestore({
+              name: prep.row.customerName.trim(),
+              phone: "",
+              notes: "Creato tramite Importazione Massiva",
+              type: "subscriber",
+            });
+            tx.set(customerRef, customerData);
+            writtenCustomers.add(prep.customerId);
+          }
+
+          const subRef = doc(db, `subscriptions/${prep.subId}`);
+          tx.set(subRef, sanitizeForFirestore(prep.subObj));
         }
       });
 
-      setSuccessMessage(`Importazione completata con successo! Inseriti ${parsedRows.length} abbonamenti.`);
+      // Materialize bookings immediately for all successfully imported subscriptions
+      const newlyCreatedSubs = preparedSubscriptions.map(p => p.subObj);
+      const alignedCount = await alignSubscriptionsListDirectly(newlyCreatedSubs);
+
+      // Warning check: are there any imported active subscriptions with 0 bookings in database?
+      const bookingsSnap = await getDocs(collection(db, "bookings"));
+      const finalBookings = (bookingsSnap as any).docs.map((d: any) => d.data());
+      const activeSubIdsWithBookings = new Set(finalBookings.filter((b: any) => b.subscriptionId).map((b: any) => b.subscriptionId));
+
+      const unmaterializedSubs = newlyCreatedSubs.filter(sub => !activeSubIdsWithBookings.has(sub.id));
+      if (unmaterializedSubs.length > 0) {
+        setErrorMessage(`Attenzione: ${unmaterializedSubs.length} periodi d'abbonamento importati sono rimasti SENZA alcuna prenotazione materializzata sulla mappa (probabili conflitti di postazione occupata).`);
+      }
+
+      setSuccessMessage(`Importazione completata con successo! Inseriti ${parsedRows.length} abbonamenti e materializzate ${alignedCount} prenotazioni.`);
       setShowBulkImportModal(false);
       setBulkInputText("");
       setParsedRows([]);
       setParsingErrors([]);
+      if (onRefresh) onRefresh();
     } catch (err: any) {
       console.error("Errore durante l'importazione massiva:", err);
       setErrorMessage(`Errore durante l'importazione: ${err.message || String(err)}`);
@@ -1334,14 +1459,14 @@ export default function SubscriptionsModule({
             }
           }
 
-          // Create Booking using deterministic ID
+          // Create Booking using deterministic ID with subscription ID suffix
           const slotKey = subData.slot === "full_day" ? "full" : subData.slot;
-          const bookingId = `${dt}_${bNum}_${slotKey}`;
+          const bookingId = `${dt}_${bNum}_${slotKey}_${subRef.id}`;
           const bookingRef = doc(db, "bookings", bookingId);
 
-          const numLettini = getBedLettiniCount(bNum, bedsConfig);
-          const defaultItems = getBedItems(bNum, numLettini);
-          const risorse = [{ postazione: bNum, items: defaultItems }];
+          const dayBookings = bookings.filter(b => b.date === dt && b.bedNumber === bNum);
+          const subItems = getSubscriptionItemsForBooking(bNum, subData.slotTypeId, dayBookings, bedsConfig);
+          const risorse = [{ postazione: bNum, items: subItems }];
 
           const finalBooking: Booking = {
             id: bookingId,
@@ -1435,7 +1560,8 @@ export default function SubscriptionsModule({
         newPeriodEndDate,
         newPeriodSlot,
         undefined,
-        newPeriodSoloWeekend
+        newPeriodSoloWeekend,
+        newPeriodSlotTypeId || undefined
       );
 
       const subData = {
@@ -1506,7 +1632,9 @@ export default function SubscriptionsModule({
         moveEffectiveDate,
         moveSub.endDate,
         moveSub.slot,
-        moveSub.id
+        moveSub.id,
+        moveSub.soloWeekend,
+        moveSub.slotTypeId
       );
 
       if (conflicts.length > 0) {
@@ -1811,6 +1939,352 @@ export default function SubscriptionsModule({
     }
   };
 
+  // Alignment helpers and actions
+  const getWaivedDatesForSub = (subId: string) => {
+    const waivedDates = new Set<string>();
+    const subLedger = ledger.filter(l => l.subscriptionId === subId && l.kind === "day_waiver_credit");
+    for (const entry of subLedger) {
+      if (entry.note && entry.note.startsWith("Rinuncia ")) {
+        let clean = entry.note.replace("Rinuncia ", "");
+        const parenIdx = clean.indexOf("(");
+        if (parenIdx !== -1) {
+          clean = clean.substring(0, parenIdx).trim();
+        }
+        const dateParts = clean.split(" - ");
+        if (dateParts.length === 2) {
+          const startYMD = parseItalianDateToYYYYMMDD(dateParts[0]);
+          const endYMD = parseItalianDateToYYYYMMDD(dateParts[1]);
+          if (startYMD && endYMD) {
+            const rangeDates = getDatesInRange(startYMD, endYMD);
+            rangeDates.forEach(d => waivedDates.add(d));
+          }
+        }
+      }
+    }
+    return waivedDates;
+  };
+
+  const handleOpenAlignModal = () => {
+    const today = getRomeTodayString();
+    const activeSubs = subscriptions.filter(s => s.status === "active");
+    const maxEnd = activeSubs.reduce((max, s) => s.endDate > max ? s.endDate : max, today > "2026-09-30" ? today : "2026-09-30");
+    setAlignStartDate(today);
+    setAlignEndDate(maxEnd);
+    setAlignResults(null);
+    setShowAlignModal(true);
+  };
+
+  const handleRunAlignMapSimulation = async () => {
+    setIsSimulatingAlign(true);
+    setErrorMessage(null);
+    try {
+      const activeSubs = subscriptions.filter(s => s.status === "active");
+      
+      const bookingsSnap = await getDocs(query(
+        collection(db, "bookings"),
+        where("date", ">=", alignStartDate),
+        where("date", "<=", alignEndDate)
+      ));
+      const fetchedBookings = (bookingsSnap as any).docs.map((doc: any) => ({ id: doc.id, ...doc.data() } as any));
+
+      const bookingsByDateAndBed = new Map<string, Booking[]>();
+      fetchedBookings.forEach(b => {
+        const key = `${b.date}_${b.bedNumber}`;
+        if (!bookingsByDateAndBed.has(key)) {
+          bookingsByDateAndBed.set(key, []);
+        }
+        bookingsByDateAndBed.get(key)!.push(b);
+      });
+
+      let alreadyAlignedCount = 0;
+      const toCreate: any[] = [];
+      const conflicts: any[] = [];
+
+      for (const sub of activeSubs) {
+        const start = sub.startDate > alignStartDate ? sub.startDate : alignStartDate;
+        const end = sub.endDate < alignEndDate ? sub.endDate : alignEndDate;
+        
+        if (start > end) continue;
+
+        const customer = customers.find(c => c.id === sub.customerId);
+        let dates = getDatesInRange(start, end);
+        
+        if (sub.soloWeekend) {
+          dates = dates.filter((d) => {
+            const parts = d.split("-");
+            if (parts.length === 3) {
+              const year = Number(parts[0]);
+              const month = Number(parts[1]) - 1;
+              const day = Number(parts[2]);
+              const dateObj = new Date(year, month, day);
+              const dayOfWeek = dateObj.getDay();
+              return dayOfWeek === 0 || dayOfWeek === 6;
+            }
+            return false;
+          });
+        }
+
+        const waivedDates = getWaivedDatesForSub(sub.id!);
+        dates = dates.filter(d => !waivedDates.has(d));
+
+        for (const dt of dates) {
+          for (const bNum of sub.bedNumbers || []) {
+            const existingBookingsOnBed = bookingsByDateAndBed.get(`${dt}_${bNum}`) || [];
+            
+            const isAlreadyAligned = existingBookingsOnBed.some(b => {
+              if (b.subscriptionId !== sub.id) return false;
+              if (sub.slot === "full_day") {
+                return b.slot === "full_day";
+              } else if (sub.slot === "morning") {
+                return b.slot === "morning" || b.slot === "full_day";
+              } else if (sub.slot === "afternoon") {
+                return b.slot === "afternoon" || b.slot === "full_day";
+              }
+              return false;
+            });
+
+            if (isAlreadyAligned) {
+              alreadyAlignedCount++;
+              continue;
+            }
+
+            const overlapping = existingBookingsOnBed.filter(ob => {
+              if (ob.subscriptionId === sub.id) return false;
+              const slotA = ob.tipoPrenotazione === "abbonato" ? "full_day" : ob.slot;
+              const slotB = sub.slot;
+              return slotA === "full_day" || slotB === "full_day" || slotA === slotB;
+            });
+
+            if (overlapping.length > 0) {
+              if (sub.slotTypeId === "1LIG") {
+                const occupiedLettini = new Set<string>();
+                overlapping.forEach(ob => {
+                  const items = getOccupiedItemsForBooking(ob, bNum, bedsConfig);
+                  items.forEach(it => {
+                    if (it.startsWith("lettino")) {
+                      occupiedLettini.add(it);
+                    }
+                  });
+                });
+                const hasWholePostazione = overlapping.some(ob => {
+                  const items = getOccupiedItemsForBooking(ob, bNum, bedsConfig);
+                  return items.includes("lettino_1") && items.includes("lettino_2");
+                });
+                const numL = getBedLettiniCount(bNum, bedsConfig);
+                const isConflict = hasWholePostazione || occupiedLettini.size >= numL;
+
+                if (isConflict) {
+                  conflicts.push({
+                    date: dt,
+                    bedNumber: bNum,
+                    expectedCustomer: customer ? customer.name : "Sconosciuto",
+                    expectedSlot: sub.slot,
+                    overlapping: overlapping.map(ob => ({
+                      customerName: ob.customerName,
+                      slot: ob.slot,
+                      source: ob.source || "manuale"
+                    }))
+                  });
+                } else {
+                  const subItems = getSubscriptionItemsForBooking(bNum, "1LIG", overlapping, bedsConfig);
+                  const risorse = [{ postazione: bNum, items: subItems }];
+                  const slotKey = sub.slot === "full_day" ? "full" : sub.slot;
+                  const bookingId = `${dt}_${bNum}_${slotKey}_${sub.id}`;
+
+                  toCreate.push({
+                    id: bookingId,
+                    bedNumber: bNum,
+                    date: dt,
+                    slot: sub.slot,
+                    tipoPrenotazione: "intera",
+                    risorse,
+                    customerId: sub.customerId,
+                    customerName: customer ? customer.name : "Sconosciuto",
+                    customerPhone: customer?.phone || "",
+                    customerType: "subscriber",
+                    subscriptionId: sub.id,
+                    source: "subscription",
+                    notes: "",
+                    origine: "allineamento",
+                    isConfirmedPayPerDay: customer?.dealType === "pay_per_day" ? false : true,
+                    dealType: customer?.dealType || "seasonal",
+                    createdAt: new Date().toISOString()
+                  });
+                }
+              } else {
+                conflicts.push({
+                  date: dt,
+                  bedNumber: bNum,
+                  expectedCustomer: customer ? customer.name : "Sconosciuto",
+                  expectedSlot: sub.slot,
+                  overlapping: overlapping.map(ob => ({
+                    customerName: ob.customerName,
+                    slot: ob.slot,
+                    source: ob.source || "manuale"
+                  }))
+                });
+              }
+            } else {
+              const subItems = getSubscriptionItemsForBooking(bNum, sub.slotTypeId, [], bedsConfig);
+              const risorse = [{ postazione: bNum, items: subItems }];
+              const slotKey = sub.slot === "full_day" ? "full" : sub.slot;
+              const bookingId = `${dt}_${bNum}_${slotKey}_${sub.id}`;
+
+              toCreate.push({
+                id: bookingId,
+                bedNumber: bNum,
+                date: dt,
+                slot: sub.slot,
+                tipoPrenotazione: "intera",
+                risorse,
+                customerId: sub.customerId,
+                customerName: customer ? customer.name : "Sconosciuto",
+                customerPhone: customer?.phone || "",
+                customerType: "subscriber",
+                subscriptionId: sub.id,
+                source: "subscription",
+                notes: "",
+                origine: "allineamento",
+                isConfirmedPayPerDay: customer?.dealType === "pay_per_day" ? false : true,
+                dealType: customer?.dealType || "seasonal",
+                createdAt: new Date().toISOString()
+              });
+            }
+          }
+        }
+      }
+
+      setAlignResults({
+        alreadyAlignedCount,
+        toCreate,
+        conflicts
+      });
+    } catch (err: any) {
+      setErrorMessage("Errore durante la simulazione: " + err.message);
+    } finally {
+      setIsSimulatingAlign(false);
+    }
+  };
+
+  const handleExecuteAlignMap = async () => {
+    if (!alignResults || alignResults.toCreate.length === 0) return;
+    setSaving(true);
+    setErrorMessage(null);
+    try {
+      let createdCount = 0;
+      const chunkSize = 400;
+      const toCreateList = alignResults.toCreate;
+      for (let i = 0; i < toCreateList.length; i += chunkSize) {
+        const chunk = toCreateList.slice(i, i + chunkSize);
+        const batch = writeBatch(db);
+        for (const b of chunk) {
+          const bookingRef = doc(db, "bookings", b.id);
+          batch.set(bookingRef, sanitizeForFirestore(b));
+          createdCount++;
+        }
+        await batch.commit();
+      }
+
+      setShowAlignModal(false);
+      setAlignResults(null);
+      setSuccessMessage(`Allineamento completato con successo. ${createdCount} nuove prenotazioni create.`);
+      if (onRefresh) onRefresh();
+      setTimeout(() => setSuccessMessage(null), 4000);
+    } catch (err: any) {
+      setErrorMessage("Errore durante l'applicazione delle prenotazioni: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const alignSubscriptionsListDirectly = async (subsToAlign: Subscription[]) => {
+    if (subsToAlign.length === 0) return 0;
+
+    const minStart = subsToAlign.reduce((min, s) => s.startDate < min ? s.startDate : min, "9999-12-31");
+    const maxEnd = subsToAlign.reduce((max, s) => s.endDate > max ? s.endDate : max, "1900-01-01");
+
+    const bookingsSnap = await getDocs(query(
+      collection(db, "bookings"),
+      where("date", ">=", minStart),
+      where("date", "<=", maxEnd)
+    ));
+    const fetchedBookings = (bookingsSnap as any).docs.map((doc: any) => ({ id: doc.id, ...doc.data() } as any));
+
+    const bookingsByDateAndBed = new Map<string, Booking[]>();
+    fetchedBookings.forEach(b => {
+      const key = `${b.date}_${b.bedNumber}`;
+      if (!bookingsByDateAndBed.has(key)) {
+        bookingsByDateAndBed.set(key, []);
+      }
+      bookingsByDateAndBed.get(key)!.push(b);
+    });
+
+    const toCreate: any[] = [];
+    
+    for (const sub of subsToAlign) {
+      const customer = customers.find(c => c.id === sub.customerId) || { name: sub.customerName || "Sconosciuto", phone: "", dealType: "seasonal" };
+      const dates = getDatesInRange(sub.startDate, sub.endDate);
+      
+      for (const dt of dates) {
+        for (const bNum of sub.bedNumbers || []) {
+          const existingBookingsOnBed = bookingsByDateAndBed.get(`${dt}_${bNum}`) || [];
+          
+          const isAlreadyAligned = existingBookingsOnBed.some(b => b.subscriptionId === sub.id);
+          if (isAlreadyAligned) continue;
+
+          const overlapping = existingBookingsOnBed.filter(ob => {
+            const slotA = ob.tipoPrenotazione === "abbonato" ? "full_day" : ob.slot;
+            const slotB = sub.slot;
+            return slotA === "full_day" || slotB === "full_day" || slotA === slotB;
+          });
+
+          if (overlapping.length > 0) {
+            continue;
+          }
+
+          const subItems = getSubscriptionItemsForBooking(bNum, sub.slotTypeId, [], bedsConfig);
+          const risorse = [{ postazione: bNum, items: subItems }];
+          const slotKey = sub.slot === "full_day" ? "full" : sub.slot;
+          const bookingId = `${dt}_${bNum}_${slotKey}_${sub.id}`;
+
+          toCreate.push({
+            id: bookingId,
+            bedNumber: bNum,
+            date: dt,
+            slot: sub.slot,
+            tipoPrenotazione: "intera",
+            risorse,
+            customerId: sub.customerId,
+            customerName: customer.name,
+            customerPhone: customer.phone || "",
+            customerType: "subscriber",
+            subscriptionId: sub.id,
+            source: "subscription",
+            notes: "",
+            origine: "allineamento",
+            isConfirmedPayPerDay: customer.dealType === "pay_per_day" ? false : true,
+            dealType: customer.dealType || "seasonal",
+            createdAt: new Date().toISOString()
+          });
+        }
+      }
+    }
+
+    if (toCreate.length > 0) {
+      const chunkSize = 400;
+      for (let i = 0; i < toCreate.length; i += chunkSize) {
+        const chunk = toCreate.slice(i, i + chunkSize);
+        const batch = writeBatch(db);
+        for (const b of chunk) {
+          batch.set(doc(db, "bookings", b.id), sanitizeForFirestore(b));
+        }
+        await batch.commit();
+      }
+    }
+    
+    return toCreate.length;
+  };
+
   // Add ledger entries (Payments/Deposits/Adjustments)
   const handleAddLedgerEntry = async (e: React.FormEvent, kind: "payment" | "deposit" | "adjustment") => {
     e.preventDefault();
@@ -1891,7 +2365,15 @@ export default function SubscriptionsModule({
               const exists = bookings.some(b => b.subscriptionId === sub.id && b.date === dt);
               if (!exists) {
                 // Perform a conflict check first
-                const conflicts = checkConflictsForBeds(sub.bedNumbers, dt, dt, sub.slot);
+                const conflicts = checkConflictsForBeds(
+                  sub.bedNumbers,
+                  dt,
+                  dt,
+                  sub.slot,
+                  undefined,
+                  sub.soloWeekend,
+                  sub.slotTypeId
+                );
                 if (conflicts.length === 0) {
                   for (const bNum of sub.bedNumbers) {
                     await createBookingTransactional({
@@ -2527,6 +3009,15 @@ export default function SubscriptionsModule({
             >
               <AlertCircle className={`w-4 h-4 ${loadingOrphans ? "animate-spin" : ""}`} />
               <span>{loadingOrphans ? "Verifica..." : "Bonifica orfane"}</span>
+            </button>
+            <button
+              id="btn-sub-align-map"
+              onClick={handleOpenAlignModal}
+              className="px-2 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 text-xs font-bold rounded-xl transition-colors flex items-center gap-1 cursor-pointer shadow-sm"
+              title="Allinea Mappa Giornaliera"
+            >
+              <RefreshCw className="w-4 h-4 animate-spin-hover" />
+              <span>Allinea Mappa</span>
             </button>
             <button
               id="btn-sub-new-tab"
@@ -4510,6 +5001,298 @@ export default function SubscriptionsModule({
                 >
                   <Trash2 className="w-4 h-4" />
                   <span>{saving ? "Eliminazione..." : `Elimina ${orphanBookings.length} prenotazioni orfane`}</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 15. ALLINEA MAPPA DIAL MODAL */}
+      {showAlignModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-xl max-w-4xl w-full max-h-[90vh] flex flex-col space-y-4">
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3 shrink-0">
+              <div className="flex items-center gap-2">
+                <RefreshCw className="w-5 h-5 text-indigo-600" />
+                <h3 className="font-extrabold text-sm text-slate-800 uppercase tracking-wider">Allineamento Mappa Giornaliera</h3>
+              </div>
+              <button 
+                type="button"
+                onClick={() => {
+                  setShowAlignModal(false);
+                  setAlignResults(null);
+                }} 
+                className="text-slate-400 hover:text-slate-600 font-bold cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Config & Parameters */}
+            <div className="bg-slate-50 rounded-xl p-4 flex flex-wrap items-center gap-4 text-xs font-semibold text-slate-700 shrink-0">
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] uppercase text-slate-400 font-bold">Intervallo Date Da</label>
+                <input
+                  type="date"
+                  value={alignStartDate}
+                  onChange={(e) => {
+                    setAlignStartDate(e.target.value);
+                    setAlignResults(null);
+                  }}
+                  className="px-2 py-1 bg-white border border-slate-200 rounded-lg text-slate-700 font-mono focus:outline-none focus:border-[#025A70]"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] uppercase text-slate-400 font-bold">A</label>
+                <input
+                  type="date"
+                  value={alignEndDate}
+                  onChange={(e) => {
+                    setAlignEndDate(e.target.value);
+                    setAlignResults(null);
+                  }}
+                  className="px-2 py-1 bg-white border border-slate-200 rounded-lg text-slate-700 font-mono focus:outline-none focus:border-[#025A70]"
+                />
+              </div>
+              <div className="flex items-end h-full pt-4">
+                <button
+                  type="button"
+                  onClick={handleRunAlignMapSimulation}
+                  disabled={isSimulatingAlign || !alignStartDate || !alignEndDate}
+                  className="px-4 py-1.5 bg-[#025A70] hover:bg-[#014152] text-white font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer shadow-sm disabled:opacity-50"
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  <span>{isSimulatingAlign ? "Analisi..." : "Esegui Simulazione"}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Results Output */}
+            <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+              {!alignResults && !isSimulatingAlign && (
+                <div className="text-center py-8 text-slate-400 text-xs font-semibold">
+                  Seleziona l'intervallo di date e clicca su "Esegui Simulazione" per analizzare la mappa.
+                </div>
+              )}
+
+              {isSimulatingAlign && (
+                <div className="flex flex-col items-center justify-center py-12 gap-3 text-slate-500 font-bold text-xs">
+                  <RefreshCw className="w-8 h-8 text-[#025A70] animate-spin" />
+                  <span>Generazione della simulazione di allineamento...</span>
+                </div>
+              )}
+
+              {alignResults && (
+                <div className="space-y-4">
+                  {/* Summary Badges */}
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-3 text-center">
+                      <span className="block text-[10px] font-black uppercase text-emerald-800 tracking-wider">Già Allineate</span>
+                      <span className="block text-2xl font-black text-emerald-700 font-mono">{alignResults.alreadyAlignedCount}</span>
+                      <span className="text-[10px] text-emerald-600 font-medium">prenotazioni ok sulla mappa</span>
+                    </div>
+                    <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-center">
+                      <span className="block text-[10px] font-black uppercase text-blue-800 tracking-wider">Da Creare</span>
+                      <span className="block text-2xl font-black text-blue-700 font-mono">{alignResults.toCreate.length}</span>
+                      <span className="text-[10px] text-blue-600 font-medium">mancanti da materializzare</span>
+                    </div>
+                    <div className="bg-amber-50 border border-amber-100 rounded-xl p-3 text-center">
+                      <span className="block text-[10px] font-black uppercase text-amber-800 tracking-wider">Conflitti</span>
+                      <span className="block text-2xl font-black text-amber-700 font-mono">{alignResults.conflicts.length}</span>
+                      <span className="text-[10px] text-amber-600 font-medium">posti occupati da altri clienti</span>
+                    </div>
+                  </div>
+
+                  {/* Section Tabs / Lists */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Da Creare Details */}
+                    <div className="border border-slate-100 rounded-xl p-4 flex flex-col max-h-[350px]">
+                      <div className="flex items-center gap-1.5 border-b border-slate-100 pb-2 mb-2 shrink-0">
+                        <Plus className="w-4 h-4 text-blue-600" />
+                        <h4 className="text-xs font-black text-slate-800 uppercase tracking-wider">Dettaglio Creazioni ({alignResults.toCreate.length})</h4>
+                      </div>
+                      <div className="flex-1 overflow-y-auto space-y-2 text-xs font-semibold">
+                        {alignResults.toCreate.length === 0 ? (
+                          <div className="text-center py-6 text-slate-400">Nessuna nuova prenotazione da creare.</div>
+                        ) : (
+                          (() => {
+                            const groupedMap = new Map<string, { customerName: string; bedMap: Map<number, { slot: string; dates: string[] }> }>();
+                            alignResults.toCreate.forEach(b => {
+                              const custId = b.customerId || "unknown";
+                              if (!groupedMap.has(custId)) {
+                                groupedMap.set(custId, {
+                                  customerName: b.customerName,
+                                  bedMap: new Map<number, { slot: string; dates: string[] }>()
+                                });
+                              }
+                              const group = groupedMap.get(custId)!;
+                              const bNum = b.bedNumber;
+                              if (!group.bedMap.has(bNum)) {
+                                group.bedMap.set(bNum, { slot: b.slot, dates: [] });
+                              }
+                              group.bedMap.get(bNum)!.dates.push(b.date);
+                            });
+
+                            const list: any[] = [];
+                            groupedMap.forEach((custVal) => {
+                              custVal.bedMap.forEach((bedVal, bNum) => {
+                                const ranges = compressDatesIntoRanges(bedVal.dates);
+                                list.push({
+                                  name: custVal.customerName,
+                                  bed: bNum,
+                                  slot: bedVal.slot,
+                                  ranges,
+                                  count: bedVal.dates.length
+                                });
+                              });
+                            });
+
+                            function compressDatesIntoRanges(dates: string[]): string[] {
+                              if (dates.length === 0) return [];
+                              const sorted = [...dates].sort();
+                              const ranges: string[] = [];
+                              
+                              let start = sorted[0];
+                              let prev = sorted[0];
+                              
+                              for (let i = 1; i < sorted.length; i++) {
+                                const current = sorted[i];
+                                const prevDate = new Date(prev);
+                                const currDate = new Date(current);
+                                const diffTime = Math.abs(currDate.getTime() - prevDate.getTime());
+                                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                                
+                                if (diffDays === 1) {
+                                  prev = current;
+                                } else {
+                                  ranges.push(start === prev ? formatItalianShortDate(start) : `${formatItalianShortDate(start)} → ${formatItalianShortDate(prev)}`);
+                                  start = current;
+                                  prev = current;
+                                }
+                              }
+                              ranges.push(start === prev ? formatItalianShortDate(start) : `${formatItalianShortDate(start)} → ${formatItalianShortDate(prev)}`);
+                              
+                              return ranges;
+                            }
+
+                            function formatItalianShortDate(dateStr: string): string {
+                              const parts = dateStr.split("-");
+                              if (parts.length === 3) {
+                                return `${parts[2]}/${parts[1]}`;
+                              }
+                              return dateStr;
+                            }
+
+                            function translateSlot(slot: string): string {
+                              if (slot === "morning") return "Mattina";
+                              if (slot === "afternoon") return "Pomeriggio";
+                              if (slot === "full_day") return "Giornata Intera";
+                              return slot;
+                            }
+
+                            return list.map((item, idx) => (
+                              <div key={idx} className="bg-slate-50 border border-slate-100 rounded-lg p-2.5 flex justify-between items-start">
+                                <div className="space-y-0.5">
+                                  <span className="block font-bold text-slate-800">{item.name}</span>
+                                  <span className="block text-[10px] text-slate-400 font-mono">
+                                    Postazione <span className="font-bold text-slate-600 font-sans">{item.bed}</span> • {translateSlot(item.slot)}
+                                  </span>
+                                  <div className="flex flex-wrap gap-1 pt-1">
+                                    {item.ranges.map((r: string, rIdx: number) => (
+                                      <span key={rIdx} className="bg-blue-50 text-blue-700 text-[9px] px-1.5 py-0.5 rounded font-mono font-bold">
+                                        {r}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                                <span className="bg-blue-100 text-blue-800 font-mono text-[10px] px-2 py-0.5 rounded-full font-black">
+                                  {item.count} gg
+                                </span>
+                              </div>
+                            ));
+                          })()
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Conflitti Details */}
+                    <div className="border border-slate-100 rounded-xl p-4 flex flex-col max-h-[350px]">
+                      <div className="flex items-center gap-1.5 border-b border-slate-100 pb-2 mb-2 shrink-0">
+                        <AlertCircle className="w-4 h-4 text-amber-600" />
+                        <h4 className="text-xs font-black text-slate-800 uppercase tracking-wider">Conflitti Rilevati ({alignResults.conflicts.length})</h4>
+                      </div>
+                      <div className="flex-1 overflow-y-auto space-y-2 text-xs font-semibold">
+                        {alignResults.conflicts.length === 0 ? (
+                          <div className="text-center py-6 text-emerald-600">Nessun conflitto rilevato! Tutte le celle sono libere.</div>
+                        ) : (
+                          (() => {
+                            function translateSlot(slot: string): string {
+                              if (slot === "morning") return "Mattina";
+                              if (slot === "afternoon") return "Pomeriggio";
+                              if (slot === "full_day") return "Giornata Intera";
+                              return slot;
+                            }
+                            function formatItalianShortDate(dateStr: string): string {
+                              const parts = dateStr.split("-");
+                              if (parts.length === 3) {
+                                return `${parts[2]}/${parts[1]}`;
+                              }
+                              return dateStr;
+                            }
+                            return alignResults.conflicts.map((c, idx) => (
+                              <div key={idx} className="bg-amber-50 border border-amber-100 rounded-lg p-2.5 space-y-1.5">
+                                <div className="flex justify-between items-center text-[10px] font-mono text-amber-800 border-b border-amber-100 pb-1 font-bold">
+                                  <span>Giorno: {formatItalianShortDate(c.date)}</span>
+                                  <span>Postazione: {c.bedNumber}</span>
+                                </div>
+                                <div className="space-y-0.5 text-[10px]">
+                                  <div>
+                                    <span className="text-slate-400 font-bold uppercase mr-1">Atteso:</span>
+                                    <span className="font-extrabold text-slate-700">{c.expectedCustomer}</span>
+                                    <span className="text-slate-400 font-medium font-mono ml-1">({translateSlot(c.expectedSlot)})</span>
+                                  </div>
+                                  <div>
+                                    <span className="text-slate-400 font-bold uppercase mr-1">Presente:</span>
+                                    {c.overlapping.map((o: any, oIdx: number) => (
+                                      <span key={oIdx} className="font-extrabold text-amber-900 inline-block mr-1">
+                                        {o.customerName} <span className="font-normal font-mono text-amber-700">({translateSlot(o.slot)})</span>
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+                            ));
+                          })()
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Bottom Actions */}
+            <div className="flex justify-end gap-3 pt-2 border-t border-slate-100 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowAlignModal(false);
+                  setAlignResults(null);
+                }}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl transition-all cursor-pointer"
+              >
+                Annulla
+              </button>
+              {alignResults && alignResults.toCreate.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleExecuteAlignMap}
+                  disabled={saving}
+                  className="px-4 py-2 bg-[#025A70] hover:bg-[#014152] text-white font-extrabold text-xs rounded-xl flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+                >
+                  <RefreshCw className={`w-4 h-4 ${saving ? "animate-spin" : ""}`} />
+                  <span>{saving ? "Generazione..." : `Applica ${alignResults.toCreate.length} creazioni`}</span>
                 </button>
               )}
             </div>

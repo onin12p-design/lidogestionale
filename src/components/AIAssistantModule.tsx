@@ -27,6 +27,91 @@ interface ChatSession {
   updatedAt: string;
 }
 
+// Inline Bold parser
+function parseBoldText(text: string): React.ReactNode[] {
+  const parts = text.split(/(\*\*.*?\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return (
+        <strong key={index} className="font-bold text-slate-900">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    return <React.Fragment key={index}>{part}</React.Fragment>;
+  });
+}
+
+// Custom simple markdown renderer
+function renderMarkdownContent(text: string): React.ReactNode {
+  if (!text) return "";
+  
+  const lines = text.split("\n");
+  return (
+    <div className="space-y-2">
+      {lines.map((line, idx) => {
+        const trimmed = line.trim();
+        
+        // Unordered List Item
+        if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+          const content = trimmed.substring(2);
+          return (
+            <ul key={idx} className="list-disc pl-4 space-y-1">
+              <li className="text-xs leading-relaxed text-slate-700">{parseBoldText(content)}</li>
+            </ul>
+          );
+        }
+        
+        // Numbered List Item
+        const numMatch = trimmed.match(/^(\d+)\.\s+(.*)$/);
+        if (numMatch) {
+          const content = numMatch[2];
+          return (
+            <ol key={idx} className="list-decimal pl-4 space-y-1">
+              <li className="text-xs leading-relaxed text-slate-700">{parseBoldText(content)}</li>
+            </ol>
+          );
+        }
+        
+        // Header
+        if (trimmed.startsWith("### ")) {
+          return (
+            <h4 key={idx} className="text-xs font-bold text-[#025A70] mt-3 mb-1">
+              {parseBoldText(trimmed.substring(4))}
+            </h4>
+          );
+        }
+        if (trimmed.startsWith("## ")) {
+          return (
+            <h3 key={idx} className="text-sm font-bold text-[#025A70] mt-4 mb-2">
+              {parseBoldText(trimmed.substring(3))}
+            </h3>
+          );
+        }
+        if (trimmed.startsWith("# ")) {
+          return (
+            <h2 key={idx} className="text-base font-bold text-[#025A70] mt-5 mb-3">
+              {parseBoldText(trimmed.substring(2))}
+            </h2>
+          );
+        }
+
+        // Empty line
+        if (trimmed === "") {
+          return <div key={idx} className="h-1" />;
+        }
+
+        // Default paragraph
+        return (
+          <p key={idx} className="text-xs leading-relaxed text-slate-700">
+            {parseBoldText(line)}
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function AIAssistantModule() {
   const [sessionId, setSessionId] = useState<string>("");
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -464,7 +549,7 @@ Puoi ora interrogarmi direttamente su questi dati!`;
                     className={`max-w-[80%] rounded-2xl px-4 py-3 text-xs leading-relaxed shadow-sm ${
                       m.role === "user"
                         ? "bg-[#025A70] text-white rounded-br-none"
-                        : "bg-white border border-slate-200 text-slate-800 rounded-bl-none whitespace-pre-wrap"
+                        : "bg-white border border-slate-200 text-slate-800 rounded-bl-none"
                     }`}
                   >
                     {m.attachment ? (
@@ -482,8 +567,10 @@ Puoi ora interrogarmi direttamente su questi dati!`;
                           <p className="text-[9px] opacity-80">{formatSize(m.attachment.size)}</p>
                         </div>
                       </a>
+                    ) : m.role === "assistant" ? (
+                      renderMarkdownContent(m.content)
                     ) : (
-                      m.content
+                      <div className="whitespace-pre-wrap">{m.content}</div>
                     )}
                   </div>
                 </div>

@@ -827,7 +827,7 @@ export async function createBookingTransactional(booking: Omit<Booking, "id" | "
             }
           });
 
-          if (hasConflict(itemBookings, slot)) {
+          if (hasConflict(itemBookings, slot, item, res.items)) {
             throw new Error(`Conflitto sulla postazione ${bedNum}, risorsa '${item === 'ombrellone' ? 'ombrellone' : 'lettino'}' già occupata per la fascia selezionata.`);
           }
         }
@@ -837,18 +837,10 @@ export async function createBookingTransactional(booking: Omit<Booking, "id" | "
       const targetRef = doc(db, "bookings", targetId);
 
       const finalBooking: Booking = {
+        ...(booking as Booking),
         id: targetId,
-        bedNumber: bed,
-        date: date,
-        slot: slot,
         tipoPrenotazione: booking.tipoPrenotazione || "intera",
         risorse: risorse,
-        customerId: booking.customerId || "",
-        customerName: booking.customerName,
-        customerType: booking.customerType,
-        subscriptionId: booking.subscriptionId || "",
-        source: booking.source,
-        notes: booking.notes || "",
         createdAt: new Date().toISOString()
       };
 

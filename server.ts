@@ -1588,7 +1588,7 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
     });
 
     let response = await generateContentWithRetry(ai, {
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: currentContents,
       config: {
         systemInstruction,
@@ -1616,7 +1616,6 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
         parts: modelParts
       };
       currentContents.push(modelTurn);
-      newTurnsToSave.push(modelTurn);
 
       const toolResponseParts: any[] = [];
 
@@ -1671,10 +1670,9 @@ Rispondi sempre in lingua italiana, con tono cordiale, professionale, chiaro ed 
         parts: toolResponseParts
       };
       currentContents.push(userTurn);
-      newTurnsToSave.push(userTurn);
 
       response = await generateContentWithRetry(ai, {
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: currentContents,
         config: {
           systemInstruction,

@@ -149,8 +149,8 @@ export function getPriceForBooking(
   const customConfig = pricingConfigs?.find((c) => c.id === month);
   if (customConfig && customConfig.prices && customConfig.prices[row]) {
     const rowPrice = customConfig.prices[row];
-    const fullDayPrice = Number(rowPrice.fullDay) ?? 30;
-    const halfDayPrice = Number(rowPrice.halfDay) ?? 15;
+    const fullDayPrice = toNumberOr(rowPrice.fullDay, 30);
+    const halfDayPrice = toNumberOr(rowPrice.halfDay, 15);
     return slot === "full_day" ? fullDayPrice : halfDayPrice;
   }
   
@@ -253,8 +253,8 @@ export function getBookingPriceProportional(
         const customConfig = pricingConfigs?.find((c) => c.id === month);
         if (customConfig && customConfig.prices && customConfig.prices[row]) {
           const rowPrice = customConfig.prices[row];
-          const fullDayTotal = Number(rowPrice.fullDay) ?? 30;
-          const halfDayTotal = Number(rowPrice.halfDay) ?? 15;
+          const fullDayTotal = toNumberOr(rowPrice.fullDay, 30);
+          const halfDayTotal = toNumberOr(rowPrice.halfDay, 15);
           const numLettini = getBedLettiniCount(bedNum, bedsConfig);
 
           // Proportional single-lettino price if custom configs exist
@@ -282,21 +282,108 @@ export function getBookingPriceProportional(
 }
 
 /**
+ * Helper to get the list of items occupied by a booking on a given bed.
+ */
+export function getOccupiedItemsForBooking(b: any, bedNumber: number, bedsConfig?: Record<number, number>): string[] {
+  if (b.risorse && b.risorse.length > 0) {
+    const res = b.risorse.find((r: any) => r.postazione === bedNumber);
+    if (res) return res.items;
+  }
+  // Fallback / legacy: complete postazione
+  const numL = getBedLettiniCount(bedNumber, bedsConfig);
+  return getBedItems(bedNumber, numL);
+}
+
+/**
+ * Assigns items for a subscription booking. If slotTypeId is "1LIG", assigns only one free lettino.
+ */
+export function getSubscriptionItemsForBooking(
+  bNum: number,
+  slotTypeId: string | undefined,
+  existingBookings: any[],
+  bedsConfig?: Record<number, number>
+): string[] {
+  const numLettini = getBedLettiniCount(bNum, bedsConfig);
+  const defaultItems = getBedItems(bNum, numLettini);
+
+  if (slotTypeId === "1LIG") {
+    const occupiedLettini = new Set<string>();
+    existingBookings.forEach((eb) => {
+      const items = getOccupiedItemsForBooking(eb, bNum, bedsConfig);
+      items.forEach((it) => {
+        if (it.startsWith("lettino")) {
+          occupiedLettini.add(it);
+        }
+      });
+    });
+
+    if (!occupiedLettini.has("lettino_1")) {
+      return ["ombrellone", "lettino_1"];
+    } else if (!occupiedLettini.has("lettino_2") && numLettini >= 2) {
+      return ["ombrellone", "lettino_2"];
+    } else {
+      return ["ombrellone", "lettino_1"];
+    }
+  }
+
+  return defaultItems;
+}
+
+/**
  * Central conflict checker based on CR-3.
  * Two bookings on the same day and same postazione and same item conflict if their slots overlap.
  */
 export function hasConflict(
-  itemBookings: Array<{ slot: "morning" | "afternoon" | "full_day"; tipoPrenotazione?: string }>,
-  nuovaFascia: "morning" | "afternoon" | "full_day"
+  itemBookings: Array<any>,
+  nuovaFascia: "morning" | "afternoon" | "full_day",
+  currentItem?: string,
+  nuoviItems?: string[]
 ): boolean {
   return itemBookings.some((b) => {
     const slotA = b.tipoPrenotazione === "abbonato" ? "full_day" : b.slot;
     const slotB = nuovaFascia;
+    
+    let slotsOverlap = false;
     if (slotA === "full_day" || slotB === "full_day") {
-      return true;
+      slotsOverlap = true;
+    } else {
+      slotsOverlap = slotA === slotB;
     }
-    return slotA === slotB;
+
+    if (!slotsOverlap) {
+      return false;
+    }
+
+    // Exception for shared "ombrellone":
+    // If checking "ombrellone" and we have details of the items, they can share if their lettini do not overlap.
+    if (currentItem === "ombrellone" && nuoviItems) {
+      const existingItems = getOccupiedItemsForBooking(b, b.bedNumber || b.postazione);
+      
+      const hasLettino1A = existingItems.includes("lettino_1");
+      const hasLettino2A = existingItems.includes("lettino_2");
+      const hasLettino1B = nuoviItems.includes("lettino_1");
+      const hasLettino2B = nuoviItems.includes("lettino_2");
+
+      const overlapLettino1 = hasLettino1A && hasLettino1B;
+      const overlapLettino2 = hasLettino2A && hasLettino2B;
+
+      if (!overlapLettino1 && !overlapLettino2) {
+        return false; // they can share the ombrellone!
+      }
+    }
+
+    return true;
   });
+}
+
+/**
+ * Safe numeric conversion helper. Converts a value to a number, and if the result
+ * is NaN, returns the provided fallback value instead.
+ */
+export function toNumberOr(value: any, fallback: number): number {
+  if (value === null || value === undefined) return fallback;
+  const num = Number(value);
+  return isNaN(num) ? fallback : num;
 }
 
 

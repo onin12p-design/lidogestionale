@@ -295,7 +295,7 @@ export default function DailyMapModule({
           }
         });
 
-        return !hasConflict(itemBookings, slot);
+        return !hasConflict(itemBookings, slot, item, [item]);
       });
 
       if (anyItemFree) {

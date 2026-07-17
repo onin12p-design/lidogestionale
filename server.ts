@@ -7,6 +7,7 @@ import dotenv from "dotenv";
 // @ts-ignore
 import mammoth from "mammoth";
 import admin from "firebase-admin";
+import { getAuth as getAdminAuth } from "firebase-admin/auth";
 
 // Firebase web imports for server-side API proxying
 import { initializeApp } from "firebase/app";
@@ -42,14 +43,14 @@ export async function ensureServerAuth() {
     return;
   }
   try {
-    const customToken = await (admin as any).auth().createCustomToken("server-operator", { staff: true });
+    const customToken = await getAdminAuth().createCustomToken("server-operator", { staff: true });
     const credential = await signInWithCustomToken(auth, customToken);
     isServerAuth = true;
     serverAuthError = null;
     console.log("Server authenticated with custom token (staff privileges) successfully:", credential.user.uid);
   } catch (err: any) {
     isServerAuth = false;
-    serverAuthError = err;
+    serverAuthError = err.message || String(err);
     console.warn("Server custom token auth failed, trying anonymous fallback:", err);
     try {
       const credential = await signInAnonymously(auth);
@@ -169,7 +170,7 @@ async function requireStaffAuth(req: express.Request, res: express.Response, nex
     }
 
     const token = authHeader.split("Bearer ")[1];
-    const decodedToken = await (admin as any).auth().verifyIdToken(token);
+    const decodedToken = await getAdminAuth().verifyIdToken(token);
 
     if (decodedToken.staff !== true) {
       res.status(403).json({ error: "Accesso negato. Permessi non sufficienti." });
@@ -202,7 +203,7 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const uid = "staff-operator";
-    const customToken = await (admin as any).auth().createCustomToken(uid, { staff: true });
+    const customToken = await getAdminAuth().createCustomToken(uid, { staff: true });
 
     res.json({ token: customToken });
   } catch (error: any) {

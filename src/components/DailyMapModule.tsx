@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { Booking, Tab, Payment, BookingSlot, CustomerType, PaymentMethod, PaymentKind, BookingTipoPrenotazione } from "../types";
 import { db, handleFirestoreError, OperationType, createBookingTransactional, getFirestore, setDoc, doc, collection, writeBatch, serverTimestamp, deleteDoc } from "../lib/firebase";
-import { getRomeTodayString, adjustDateString, formatItalianDate, isValidBedNumber, sanitizeForFirestore, getPriceForBooking, getBookingPriceProportional, getBedLettiniCount, getBedItems, hasConflict } from "../utils";
+import { getRomeTodayString, adjustDateString, formatItalianDate, isValidBedNumber, sanitizeForFirestore, getPriceForBooking, getBookingPriceProportional, getBedLettiniCount, getBedItems, hasConflict, VALID_BEDS } from "../utils";
 import BedMap, { PEDANA_SINISTRA_LEFT, PEDANA_SINISTRA_RIGHT, PEDANA_DESTRA_LEFT, PEDANA_DESTRA_RIGHT } from "./BedMap";
 import { Calendar, ChevronLeft, ChevronRight, Search, Plus, Trash2, CreditCard, Coffee, Check, AlertCircle, Info, Users, Save, Clock, Printer, X, Maximize2, Minimize2, ExternalLink } from "lucide-react";
 import ConfirmationModal from "./ConfirmationModal";
@@ -82,9 +82,9 @@ export default function DailyMapModule({
       doc.line(14, 31, 196, 31);
     };
 
-    const leftBookings = bookings.filter(b => b.bedNumber <= 34).sort((a, b) => a.bedNumber - b.bedNumber);
-    const rightBookings = bookings.filter(b => b.bedNumber > 34).sort((a, b) => a.bedNumber - b.bedNumber);
-    const sortedBookings = [...leftBookings, ...rightBookings];
+    const leftBeds = Array.from(VALID_BEDS).filter(num => num <= 34).sort((a, b) => a - b);
+    const rightBeds = Array.from(VALID_BEDS).filter(num => num > 34).sort((a, b) => a - b);
+    const sortedBeds = [...leftBeds, ...rightBeds];
 
     const paymentsByBookingId = new Map<string, Payment[]>();
     payments.forEach(p => {
@@ -96,34 +96,51 @@ export default function DailyMapModule({
       }
     });
 
-    const tableBody = sortedBookings.map((b) => {
-      const isSubscriber = b.customerType === "subscriber";
-      const isHotel = b.isHotel;
-      const tipoLabel = isSubscriber ? "Abbonamento" : isHotel ? "Hotel" : "Giornaliero";
-      const side = b.bedNumber <= 34 ? "SX" : "DX";
+    const tableBody = sortedBeds.flatMap((bedNum) => {
+      const bedBookings = bookings.filter(b => b.bedNumber === bedNum);
+      const side = bedNum <= 34 ? "SX" : "DX";
 
-      const bPayments = paymentsByBookingId.get(b.id) || [];
-      let amountText = "–";
-      let methodText = "Da pagare";
-      if (bPayments.length > 0) {
-        const totalAmount = bPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
-        amountText = `${totalAmount} €`;
-        const methodsSet = new Set(bPayments.map(p => {
-          if (p.method === "card") return "Carta";
-          if (p.method === "cash") return "Contanti";
-          return p.method || "";
-        }).filter(Boolean));
-        methodText = Array.from(methodsSet).join(" + ") || "Da pagare";
+      if (bedBookings.length === 0) {
+        return [
+          [
+            `${bedNum} ${side}`,
+            "-",
+            "Libero",
+            "-",
+            "-",
+            "-"
+          ]
+        ];
       }
 
-      return [
-        `${b.bedNumber} ${side}`,
-        b.customerName,
-        tipoLabel,
-        b.notes || "-",
-        amountText,
-        methodText
-      ];
+      return bedBookings.map((b) => {
+        const isSubscriber = b.customerType === "subscriber";
+        const isHotel = b.isHotel;
+        const tipoLabel = isSubscriber ? "Abbonamento" : isHotel ? "Hotel" : "Giornaliero";
+
+        const bPayments = paymentsByBookingId.get(b.id) || [];
+        let amountText = "–";
+        let methodText = "Da pagare";
+        if (bPayments.length > 0) {
+          const totalAmount = bPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
+          amountText = `${totalAmount} €`;
+          const methodsSet = new Set(bPayments.map(p => {
+            if (p.method === "card") return "Carta";
+            if (p.method === "cash") return "Contanti";
+            return p.method || "";
+          }).filter(Boolean));
+          methodText = Array.from(methodsSet).join(" + ") || "Da pagare";
+        }
+
+        return [
+          `${b.bedNumber} ${side}`,
+          b.customerName,
+          tipoLabel,
+          b.notes || "-",
+          amountText,
+          methodText
+        ];
+      });
     });
 
     let totalIncassato = 0;
@@ -1601,63 +1618,83 @@ export default function DailyMapModule({
                     </thead>
                     <tbody className="divide-y divide-slate-200">
                       {(() => {
-                        const leftBookings = bookings.filter(b => b.bedNumber <= 34).sort((a, b) => a.bedNumber - b.bedNumber);
-                        const rightBookings = bookings.filter(b => b.bedNumber > 34).sort((a, b) => a.bedNumber - b.bedNumber);
-                        const sortedBookings = [...leftBookings, ...rightBookings];
+                        const leftBeds = Array.from(VALID_BEDS).filter(num => num <= 34).sort((a, b) => a - b);
+                        const rightBeds = Array.from(VALID_BEDS).filter(num => num > 34).sort((a, b) => a - b);
+                        const sortedBeds = [...leftBeds, ...rightBeds];
 
-                        if (sortedBookings.length === 0) {
-                          return (
-                            <tr>
-                              <td colSpan={6} className="py-8 text-center text-slate-400 italic">
-                                Nessun cliente presente nelle postazioni per il giorno selezionato.
-                              </td>
-                            </tr>
-                          );
-                        }
+                        return sortedBeds.flatMap((bedNum) => {
+                          const bedBookings = bookings.filter(b => b.bedNumber === bedNum);
+                          const side = bedNum <= 34 ? "SX" : "DX";
 
-                        return sortedBookings.map((b) => {
-                          const isSubscriber = b.customerType === "subscriber";
-                          const isHotel = b.isHotel;
-                          const tipoLabel = isSubscriber ? "Abbonamento" : isHotel ? "Hotel" : "Giornaliero";
-                          const side = b.bedNumber <= 34 ? "SX" : "DX";
-                          
-                          // Look up payments for this booking
-                          const bPayments = payments.filter((p) => p.bookingId === b.id);
-                          let amountText = "–";
-                          let methodText = "Da pagare";
-                          if (bPayments.length > 0) {
-                            const totalAmount = bPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
-                            amountText = `${totalAmount} €`;
-                            const methodsSet = new Set(bPayments.map(p => {
-                              if (p.method === "card") return "Carta";
-                              if (p.method === "cash") return "Contanti";
-                              return p.method || "";
-                            }).filter(Boolean));
-                            methodText = Array.from(methodsSet).join(" + ") || "Da pagare";
+                          if (bedBookings.length === 0) {
+                            const rowKey = `empty-bed-${bedNum}`;
+                            return [
+                              <tr key={rowKey} className="even:bg-slate-50/80">
+                                <td className="py-2.5 px-3 border border-slate-300 font-extrabold text-center text-slate-400 bg-slate-50/30">
+                                  {bedNum} {side}
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 font-medium text-slate-400">
+                                  -
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 font-medium text-slate-400 italic">
+                                  Libero
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 text-slate-400">
+                                  -
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 text-right text-slate-400">
+                                  -
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 text-center text-slate-400">
+                                  -
+                                </td>
+                              </tr>
+                            ];
                           }
 
-                          return (
-                            <tr key={b.id} className="even:bg-slate-50/80">
-                              <td className="py-2.5 px-3 border border-slate-300 font-extrabold text-center text-slate-900 bg-slate-50/50">
-                                {b.bedNumber} {side}
-                              </td>
-                              <td className="py-2.5 px-3 border border-slate-300 font-bold uppercase text-slate-900">
-                                {b.customerName}
-                              </td>
-                              <td className="py-2.5 px-3 border border-slate-300 font-medium text-slate-700">
-                                {tipoLabel}
-                              </td>
-                              <td className="py-2.5 px-3 border border-slate-300 text-slate-600 text-[11pt]">
-                                {b.notes || "-"}
-                              </td>
-                              <td className="py-2.5 px-3 border border-slate-300 font-bold text-right text-slate-950">
-                                {amountText}
-                              </td>
-                              <td className="py-2.5 px-3 border border-slate-300 font-bold text-center text-slate-800">
-                                {methodText}
-                              </td>
-                            </tr>
-                          );
+                          return bedBookings.map((b) => {
+                            const isSubscriber = b.customerType === "subscriber";
+                            const isHotel = b.isHotel;
+                            const tipoLabel = isSubscriber ? "Abbonamento" : isHotel ? "Hotel" : "Giornaliero";
+
+                            // Look up payments for this booking
+                            const bPayments = payments.filter((p) => p.bookingId === b.id);
+                            let amountText = "–";
+                            let methodText = "Da pagare";
+                            if (bPayments.length > 0) {
+                              const totalAmount = bPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
+                              amountText = `${totalAmount} €`;
+                              const methodsSet = new Set(bPayments.map(p => {
+                                if (p.method === "card") return "Carta";
+                                if (p.method === "cash") return "Contanti";
+                                return p.method || "";
+                              }).filter(Boolean));
+                              methodText = Array.from(methodsSet).join(" + ") || "Da pagare";
+                            }
+
+                            return (
+                              <tr key={b.id} className="even:bg-slate-50/80">
+                                <td className="py-2.5 px-3 border border-slate-300 font-extrabold text-center text-slate-900 bg-slate-50/50">
+                                  {b.bedNumber} {side}
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 font-bold uppercase text-slate-900">
+                                  {b.customerName}
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 font-medium text-slate-700">
+                                  {tipoLabel}
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 text-slate-600 text-[11pt]">
+                                  {b.notes || "-"}
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 font-bold text-right text-slate-950">
+                                  {amountText}
+                                </td>
+                                <td className="py-2.5 px-3 border border-slate-300 font-bold text-center text-slate-800">
+                                  {methodText}
+                                </td>
+                              </tr>
+                            );
+                          });
                         });
                       })()}
                     </tbody>

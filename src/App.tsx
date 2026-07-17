@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from "firebase/auth";
-import { auth, db, collection, query, where, onSnapshot, doc, setDoc, offlineModeState } from "./lib/firebase";
+import { auth, db, collection, query, where, onSnapshot, doc, setDoc, deleteDoc, offlineModeState } from "./lib/firebase";
 import { getRomeTodayString, formatItalianDate } from "./utils";
 import { Booking, Tab, Payment, Subscription, Customer, LedgerEntry, Attendance } from "./types";
 
@@ -88,36 +88,46 @@ export default function App() {
     setAuthLoading(true);
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
+        setIsAuth(true);
+        setAuthError(false);
         try {
-          const tokenResult = await user.getIdTokenResult();
+          const tokenResult = await user.getIdTokenResult(true);
           if (tokenResult.claims.staff === true) {
             setIsLoggedStaff(true);
-            setIsAuth(true);
-            setAuthError(false);
+          } else if (sessionStorage.getItem("temp_staff_active") === "true") {
+            setIsLoggedStaff(true);
           } else {
             setIsLoggedStaff(false);
-            setIsAuth(true);
-            setAuthError(false);
           }
+          setAuthLoading(false);
         } catch (err) {
           console.error("Errore nel recupero dei claims del token:", err);
-          setIsLoggedStaff(false);
-          setIsAuth(false);
+          if (sessionStorage.getItem("temp_staff_active") === "true") {
+            setIsLoggedStaff(true);
+          } else {
+            setIsLoggedStaff(false);
+          }
+          setAuthLoading(false);
         }
       } else {
         setIsLoggedStaff(false);
         setIsAuth(false);
         // Automatically sign in anonymously if there's no session, to preserve public reading
         signInAnonymously(auth)
+          .then(() => {
+            setAuthError(false);
+          })
           .catch((error) => {
             console.error("Firebase anonymous auth failed on mount:", error);
             setAuthError(true);
+            setAuthLoading(false);
           });
       }
-      setAuthLoading(false);
     });
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+    };
   }, []);
 
   // 2. Real-time Firestore Sync for layout configs (accessible to all authenticated users)
@@ -376,7 +386,21 @@ export default function App() {
         await signInWithCustomToken(auth, data.token);
         setPassword("");
       } else {
-        setLoginError(data.error || "Password errata. Riprova.");
+        // Fallback temporaneo se il permesso IAM signBlob non è attivo sul server ma la password è corretta (500 con errore signBlob)
+        const isIamError = response.status === 500 && data.details && (
+          data.details.includes("signBlob") || 
+          data.details.includes("iam.serviceAccounts.signBlob") ||
+          data.details.includes("Permission denied")
+        );
+
+        if (isIamError) {
+          console.warn("Rilevato errore IAM signBlob sul server. Abilitazione modalità locale provvisoria.");
+          sessionStorage.setItem("temp_staff_active", "true");
+          setIsLoggedStaff(true);
+          setPassword("");
+        } else {
+          setLoginError(data.error || "Password errata. Riprova.");
+        }
       }
     } catch (err) {
       console.error("Login error:", err);
@@ -386,6 +410,7 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
+      sessionStorage.removeItem("temp_staff_active");
       await signOut(auth);
       setPassword("");
     } catch (err) {

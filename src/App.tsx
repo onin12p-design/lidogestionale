@@ -120,9 +120,58 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // 2. Real-time Firestore Sync based on currentDate and Auth
+  // 2. Real-time Firestore Sync for layout configs (accessible to all authenticated users)
   useEffect(() => {
-    if (!isAuth || !currentDate) return;
+    if (!isAuth) return;
+
+    // Beds configuration
+    const bedsConfigRef = doc(db, "settings", "beds");
+    const unsubscribeBeds = onSnapshot(bedsConfigRef, (docSnap) => {
+      if (docSnap.exists()) {
+        setBedsConfig(docSnap.data() as Record<number, number>);
+      }
+    }, (err) => console.error("Beds settings sync error:", err));
+
+    // Rows configuration
+    const rowsConfigRef = doc(db, "settings", "rows");
+    const unsubscribeRows = onSnapshot(rowsConfigRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        const mapped: Record<number, number> = {};
+        Object.entries(data).forEach(([k, v]) => {
+          mapped[Number(k)] = Number(v);
+        });
+        setRowsConfig(mapped);
+      } else {
+        // Initialize rows config in Firestore if not exists (CR-4)
+        const initialRows: Record<string, number> = {};
+        const row1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70];
+        const row2 = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81];
+        const row3 = [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92];
+        const row4 = [31, 32, 33, 34, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103];
+        const row5 = [104, 105, 106, 107, 108, 109];
+
+        row1.forEach(b => initialRows[b.toString()] = 1);
+        row2.forEach(b => initialRows[b.toString()] = 2);
+        row3.forEach(b => initialRows[b.toString()] = 3);
+        row4.forEach(b => initialRows[b.toString()] = 4);
+        row5.forEach(b => initialRows[b.toString()] = 5);
+
+        setDoc(rowsConfigRef, initialRows)
+          .then(() => console.log("Initialized rows settings on Firestore."))
+          .catch(err => console.error("Error initializing rows settings:", err));
+      }
+    }, (err) => console.error("Rows settings sync error:", err));
+
+    return () => {
+      unsubscribeBeds();
+      unsubscribeRows();
+    };
+  }, [isAuth]);
+
+  // 3. Real-time Firestore Sync for staff-only management collections (requires isLoggedStaff)
+  useEffect(() => {
+    if (!isAuth || !isLoggedStaff || !currentDate) return;
 
     setLoadingData(true);
 
@@ -248,45 +297,6 @@ export default function App() {
       setPricingConfigs(list);
     }, (err) => console.error("Pricing sync error:", err));
 
-    // Beds configuration
-    const bedsConfigRef = doc(db, "settings", "beds");
-    const unsubscribeBeds = onSnapshot(bedsConfigRef, (docSnap) => {
-      if (docSnap.exists()) {
-        setBedsConfig(docSnap.data() as Record<number, number>);
-      }
-    }, (err) => console.error("Beds settings sync error:", err));
-
-    // Rows configuration
-    const rowsConfigRef = doc(db, "settings", "rows");
-    const unsubscribeRows = onSnapshot(rowsConfigRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        const mapped: Record<number, number> = {};
-        Object.entries(data).forEach(([k, v]) => {
-          mapped[Number(k)] = Number(v);
-        });
-        setRowsConfig(mapped);
-      } else {
-        // Initialize rows config in Firestore if not exists (CR-4)
-        const initialRows: Record<string, number> = {};
-        const row1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70];
-        const row2 = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81];
-        const row3 = [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92];
-        const row4 = [31, 32, 33, 34, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103];
-        const row5 = [104, 105, 106, 107, 108, 109];
-
-        row1.forEach(b => initialRows[b.toString()] = 1);
-        row2.forEach(b => initialRows[b.toString()] = 2);
-        row3.forEach(b => initialRows[b.toString()] = 3);
-        row4.forEach(b => initialRows[b.toString()] = 4);
-        row5.forEach(b => initialRows[b.toString()] = 5);
-
-        setDoc(rowsConfigRef, initialRows)
-          .then(() => console.log("Initialized rows settings on Firestore."))
-          .catch(err => console.error("Error initializing rows settings:", err));
-      }
-    }, (err) => console.error("Rows settings sync error:", err));
-
     // Subscription Setup configuration
     const subscriptionSetupRef = doc(db, "config", "subscriptionSetup");
     const unsubscribeSubscriptionSetup = onSnapshot(subscriptionSetupRef, (docSnap) => {
@@ -347,12 +357,10 @@ export default function App() {
       unsubscribeLedger();
       unsubscribeAttendance();
       unsubscribePricing();
-      unsubscribeBeds();
-      unsubscribeRows();
       unsubscribeSubscriptionSetup();
       unsubscribePriceList();
     };
-  }, [isAuth, currentDate]);
+  }, [isAuth, isLoggedStaff, currentDate]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();

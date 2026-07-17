@@ -11,7 +11,7 @@ import admin from "firebase-admin";
 // Firebase web imports for server-side API proxying
 import { initializeApp } from "firebase/app";
 import { getFirestore, collection, getDocs, query, where, doc, getDoc, setDoc, addDoc } from "firebase/firestore";
-import { getAuth, signInAnonymously } from "firebase/auth";
+import { getAuth, signInAnonymously, signInWithCustomToken } from "firebase/auth";
 import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import fs from "fs";
 import { promises as fsPromises } from "fs";
@@ -42,15 +42,23 @@ export async function ensureServerAuth() {
     return;
   }
   try {
-    const credential = await signInAnonymously(auth);
+    const customToken = await (admin as any).auth().createCustomToken("server-operator", { staff: true });
+    const credential = await signInWithCustomToken(auth, customToken);
     isServerAuth = true;
     serverAuthError = null;
-    console.log("Server authenticated with Firestore successfully:", credential.user.uid);
+    console.log("Server authenticated with custom token (staff privileges) successfully:", credential.user.uid);
   } catch (err: any) {
     isServerAuth = false;
     serverAuthError = err;
-    console.warn("Server anonymous auth failed (proceeding in unauthenticated fallback mode):", err);
-    // Do not throw; proceed unauthenticated so that the server can still make queries if firestore.rules allows it or are not yet active.
+    console.warn("Server custom token auth failed, trying anonymous fallback:", err);
+    try {
+      const credential = await signInAnonymously(auth);
+      isServerAuth = true;
+      serverAuthError = null;
+      console.log("Server authenticated anonymously:", credential.user.uid);
+    } catch (anonErr: any) {
+      console.warn("Server anonymous auth fallback also failed:", anonErr);
+    }
   }
 }
 
